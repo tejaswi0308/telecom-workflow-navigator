@@ -1,4 +1,5 @@
-import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
@@ -11,16 +12,18 @@ load_dotenv()
 # ── 1. Load all markdown files from data folder ──────────────────────────────
 print("Loading workflow markdown files...")
 
-data_path = "../data"
-documents = []
+backend_dir = Path(__file__).resolve().parent
+data_path = backend_dir.parent / "data"
 
-for filename in os.listdir(data_path):
-    if filename.endswith(".md"):
-        filepath = os.path.join(data_path, filename)
-        workflow_name = filename.replace(".md", "").replace("_", " ").title()
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        documents.append((workflow_name, content))
+loader = DirectoryLoader(
+    str(data_path),
+    glob="**/*.md",
+    loader_cls=TextLoader,
+    loader_kwargs={"encoding": "utf-8"},
+    show_progress=True,
+)
+
+documents = loader.load()
 
 print(f"Loaded {len(documents)} workflow files")
 
@@ -40,8 +43,9 @@ splitter = MarkdownHeaderTextSplitter(
 
 all_chunks = []
 
-for workflow_name, content in documents:
-    chunks = splitter.split_text(content)
+for document in documents:
+    workflow_name = Path(document.metadata["source"]).stem.replace("_", " ").title()
+    chunks = splitter.split_text(document.page_content)
     for chunk in chunks:
         # Add workflow name as metadata on every chunk
         chunk.metadata["workflow"] = workflow_name
@@ -64,7 +68,7 @@ print("Creating FAISS vector store... this may take a minute")
 vectorstore = FAISS.from_documents(all_chunks, embeddings)
 
 # Save locally
-faiss_path = "../faiss_index"
+faiss_path = backend_dir.parent / "faiss_index"
 vectorstore.save_local(faiss_path)
 
 print(f"Vector store saved to {faiss_path}")
