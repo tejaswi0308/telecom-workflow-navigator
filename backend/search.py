@@ -1,44 +1,23 @@
 import argparse
-import os
-from pathlib import Path
 
-from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-
-
-load_dotenv()
-
-
-def build_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-    )
-
-
-def load_vectorstore(index_path: Path) -> FAISS:
-    if not index_path.exists():
-        raise FileNotFoundError(
-            f"FAISS index not found at {index_path}. Run ingest.py first."
-        )
-
-    return FAISS.load_local(
-        str(index_path),
-        build_embeddings(),
-        allow_dangerous_deserialization=True,
-    )
+try:
+    from backend.utils import build_retrieval_queries, get_index_path, load_vectorstore, merge_scored_results, strip_markdown_formatting
+except ImportError:
+    from utils import build_retrieval_queries, get_index_path, load_vectorstore, merge_scored_results, strip_markdown_formatting    
 
 
 def search(query: str, top_k: int = 3) -> None:
-    backend_dir = Path(__file__).resolve().parent
-    index_path = backend_dir.parent / "faiss_index"
+    index_path = get_index_path()
 
     print(f"Loading FAISS index from {index_path}...")
     vectorstore = load_vectorstore(index_path)
 
     print(f"Searching for: {query}")
-    results = vectorstore.similarity_search_with_score(query, k=top_k)
+    candidate_k = max(top_k * 3, top_k + 5)
+    candidates = []
+    for retrieval_query in build_retrieval_queries(query):
+        candidates.extend(vectorstore.similarity_search_with_score(retrieval_query, k=candidate_k))
+    results = merge_scored_results(candidates, top_k)
 
     if not results:
         print("No matches found.")
@@ -47,8 +26,8 @@ def search(query: str, top_k: int = 3) -> None:
     for rank, (document, score) in enumerate(results, start=1):
         workflow = document.metadata.get("workflow", "Unknown")
         source = document.metadata.get("source", workflow)
-        content = document.page_content.strip().replace("\n", " ")
-        preview = content[:300] + ("..." if len(content) > 300 else "")
+        content = strip_markdown_formatting(document.page_content.strip()).replace("\n", " ")
+        preview = content[:500] + ("..." if len(content) > 500 else "")
 
         print(f"\nResult {rank}")
         print(f"Workflow: {workflow}")

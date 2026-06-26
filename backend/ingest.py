@@ -45,13 +45,16 @@ all_chunks = []
 
 for document in documents:
     workflow_name = Path(document.metadata["source"]).stem.replace("_", " ").title()
+    workflow_slug = Path(document.metadata["source"]).stem.lower().replace("_workflow", "")
     chunks = splitter.split_text(document.page_content)
     for chunk in chunks:
-        # Add workflow name as metadata on every chunk
         chunk.metadata["workflow"] = workflow_name
         chunk.metadata["source"] = workflow_name
+        chunk.metadata["workflow_slug"] = workflow_slug  
         all_chunks.append(chunk)
 
+# print(chunk)
+    
 print(f"Total chunks created: {len(all_chunks)}")
 
 # ── 3. Create embeddings ──────────────────────────────────────────────────────
