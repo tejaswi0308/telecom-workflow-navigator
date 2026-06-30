@@ -402,7 +402,7 @@ def rewrite_question(
     question: str,
     history: list[dict[str, str]],
     verbose: bool = False,
-    langfuse_handler=None,          # Fix 3: accept handler so rewrite is also traced
+    langfuse_handler=None,
 ) -> str:
     if (
         not history
@@ -422,7 +422,6 @@ def rewrite_question(
         "Standalone Question:"
     )
 
-    # Fix 3: wire the handler so this LLM call is traced in Langfuse
     callbacks = [langfuse_handler] if langfuse_handler else []
     response = llm.invoke(prompt, config={"callbacks": callbacks})
     rewritten = response.content.strip()
@@ -437,36 +436,60 @@ def _has_structured_content(text: str) -> bool:
     (bold markers, arrows, approval chains) that should be preserved.
     Stripping such answers would destroy meaningful structure.
     """
-    # Bold text used in approval chains: **Circle Head**, **Regional Head**, etc.
     if re.search(r"\*\*[^*]+\*\*", text):
         return True
-    # Arrow-separated chains: A → B → C
     if "→" in text or "->" in text:
         return True
     return False
 
 
-def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> None:
-    # Langfuse v3+: CallbackHandler() reuses a singleton Langfuse client.
-    # That singleton must be initialised with credentials BEFORE the handler
-    # is constructed — otherwise it is silently disabled and sends 0 traces.
-    # Explicitly init the singleton first, then let CallbackHandler pick it up.
+def _build_langfuse_handler() -> CallbackHandler | None:
+    """
+    Initialises the Langfuse singleton (if credentials are present) and
+    returns a CallbackHandler bound to it. Returns None if Langfuse is not
+    configured, so tracing is optional rather than a hard requirement.
+    """
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+
+    if not public_key or not secret_key:
+        return None
+
     Langfuse(
-        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+        public_key=public_key,
+        secret_key=secret_key,
         host=os.getenv("LANGFUSE_BASE_URL"),
     )
-    langfuse_handler = CallbackHandler()  # picks up the live singleton above
+    return CallbackHandler()
+
+
+def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> dict:
+    """
+    Core RAG entry point. Returns a structured result instead of printing,
+    so it can be reused by both the CLI (main()) and the FastAPI layer.
+
+    Return shape:
+    {
+        "answer": str,
+        "sources": [{"workflow": str, "score": float}, ...],
+        "error": str | None,   # set if something went wrong, answer/sources still safe defaults
+    }
+    """
+    langfuse_handler = _build_langfuse_handler()
 
     index_path = get_index_path()
-    vectorstore = load_vectorstore(index_path)
+
+    try:
+        vectorstore = load_vectorstore(index_path)
+    except FileNotFoundError as exc:
+        return {"answer": str(exc), "sources": [], "error": "index_not_found"}
 
     history = load_chat_memory()
     standalone_question = rewrite_question(
         question,
         history,
         verbose=verbose,
-        langfuse_handler=langfuse_handler,   # Fix 3: propagate handler
+        langfuse_handler=langfuse_handler,
     )
 
     if (
@@ -474,13 +497,12 @@ def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> None:
         and not is_explicit_topic_question(standalone_question)
         and not history
     ):
-        print("\nAnswer")
-        print(
+        answer = (
             "I'm sorry, but your question refers to a previous topic, and there is no "
             "active chat history saved. Could you please specify which workflow you are "
             "talking about?"
         )
-        return
+        return {"answer": answer, "sources": [], "error": None}
 
     # Dynamic workflow router — no hardcoded strings
     inferred_wf = infer_workflow_type(question) or infer_workflow_type(standalone_question)
@@ -505,12 +527,9 @@ def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> None:
         results = merge_scored_results(candidates, top_k)
 
     if not results:
-        print("No relevant context found.")
-        return
+        return {"answer": "No relevant context found.", "sources": [], "error": None}
 
     # Direct answer parser — only for simple list/step questions.
-    # Complex queries (approval chains, hierarchies, full process details)
-    # must always go to the LLM for proper reasoning over retrieved context.
     use_direct_parser = (
         is_process_question(standalone_question)
         and any(
@@ -524,18 +543,17 @@ def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> None:
         direct_answer = build_process_direct_answer(standalone_question, results)
         if direct_answer:
             answer_text, matched_workflow = direct_answer
-            print("\nAnswer")
-            print(answer_text)
 
             history.append({"user": question, "assistant": answer_text})
             save_chat_memory(history)
 
-            print("\nSources")
-            for idx, (document, score) in enumerate(results, start=1):
+            sources = []
+            for document, score in results:
                 workflow = document.metadata.get("workflow", "Unknown")
                 if workflow == matched_workflow:
-                    print(f"- [{idx}] {workflow} (score: {score})")
-            return
+                    sources.append({"workflow": workflow, "score": float(score)})
+
+            return {"answer": answer_text, "sources": sources, "error": None}
 
     # LLM path — used for all complex, approval, hierarchy, and general questions
     context = format_context(results)
@@ -554,33 +572,29 @@ def rag_answer(question: str, top_k: int = 8, verbose: bool = False) -> None:
         "Answer:"
     )
 
-    # Fix 2: pass langfuse_handler so the main answer is traced
-    response = llm.invoke(prompt, config={"callbacks": [langfuse_handler]})
+    callbacks = [langfuse_handler] if langfuse_handler else []
+    response = llm.invoke(prompt, config={"callbacks": callbacks})
 
-    print("\nAnswer")
     answer = response.content.strip()
 
-    # Bug 3 fix: only strip markdown formatting if the answer contains no structured
-    # content (bold markers, arrow chains). Stripping approval chains like
-    # **Circle Head** → **Regional Head** destroys meaningful LLM output.
     if _has_structured_content(answer):
         answer_clean = answer
     else:
         answer_clean = strip_markdown_formatting(answer)
 
-    print(answer_clean)
-
     history.append({"user": question, "assistant": answer_clean})
     save_chat_memory(history)
 
-    print("\nSources")
+    sources = []
     seen = set()
-    for idx, (document, score) in enumerate(results, start=1):
+    for document, score in results:
         workflow = document.metadata.get("workflow", "Unknown")
         if workflow in seen:
             continue
         seen.add(workflow)
-        print(f"- [{idx}] {workflow} (score: {score})")
+        sources.append({"workflow": workflow, "score": float(score)})
+
+    return {"answer": answer_clean, "sources": sources, "error": None}
 
 
 def main() -> None:
@@ -594,7 +608,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rag_answer(args.question, top_k=args.top_k, verbose=args.verbose)
+    result = rag_answer(args.question, top_k=args.top_k, verbose=args.verbose)
+
+    print("\nAnswer")
+    print(result["answer"])
+
+    if result["sources"]:
+        print("\nSources")
+        for idx, source in enumerate(result["sources"], start=1):
+            print(f"- [{idx}] {source['workflow']} (score: {source['score']})")
 
 
 if __name__ == "__main__":
