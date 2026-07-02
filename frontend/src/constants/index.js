@@ -15,7 +15,7 @@ export const WORKFLOWS = [
 
 export const SUGGESTIONS = [
   "What are the steps in the Tenancy Cancellation workflow?",
-  "Who approves rent revision at corporate level?",
-  "What happens after SR is raised in Colocation?",
+  "Explain the Elevar Mobile DG Workflow?",
+  "What are the steps in the Share Workflow?",
   "Explain the Amendment workflow process",
 ];
