@@ -61,14 +61,36 @@ export default function App() {
     sendMessage(`Tell me about the ${wf}`);
   }
 
-  function handleNewChat() {
+  async function handleNewChat() {
+    // Clear frontend state
     setMessages([]);
     setActiveWorkflow(null);
+
+    // Clear server-side memory so next conversation
+    // starts with a completely clean context window
+    try {
+      await fetch("/api/history", { method: "DELETE" });
+    } catch {
+      // non-critical — UI is already cleared
+      console.warn("Could not clear server-side chat history.");
+    }
   }
 
-  function handleFeedback(feedback) {
-    // Placeholder — wire to DB later
-    console.log("Feedback received:", feedback);
+  async function handleFeedback(feedback) {
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message_id: String(feedback.messageId),
+          type: feedback.type,
+          comment: feedback.comment || null,
+        }),
+      });
+    } catch {
+      // feedback is non-critical — silently ignore if it fails
+      console.warn("Feedback submission failed:", feedback);
+    }
   }
 
   return (
