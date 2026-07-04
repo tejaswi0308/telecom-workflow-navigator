@@ -42,7 +42,7 @@ export default function TypingIndicator() {
         borderBottomLeftRadius: 4,
         boxShadow: "var(--shadow-sm)",
       }}>
-        {[0, 0.2, 0.4].map((delay, i) => (
+        {[0, 0.2, 0.6].map((delay, i) => (
           <div
             key={i}
             style={{

@@ -5,7 +5,7 @@ export default function Sources({ sources }) {
 
   if (!sources || sources.length === 0) return null;
 
-  return (
+  return (  
     <div style={{ padding: "2px 32px 8px" }}>
 
       {/* Toggle */}

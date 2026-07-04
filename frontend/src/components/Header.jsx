@@ -6,13 +6,10 @@ export default function Header() {
       borderBottom: "1px solid var(--border)",
       display: "flex",
       alignItems: "center",
-      justifyContent: "space-between",
-      padding: "0 24px",
+      padding: "34px 24px",
       boxShadow: "var(--shadow-sm)",
       zIndex: 20,
-      flexShrink: 0,
     }}>
-      {/* Brand */}
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
         <div style={{
           width: 34, height: 34,
@@ -21,35 +18,16 @@ export default function Header() {
           display: "flex", alignItems: "center", justifyContent: "center",
           boxShadow: "0 2px 8px rgba(47,56,144,0.30)",
         }}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.2">
-            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-            <path d="M2 17l10 5 10-5"/>
-            <path d="M2 12l10 5 10-5"/>
-          </svg>
+          <img src="https://img.icons8.com/?size=100&id=QhlCcbzScElq&format=png&color=ffffff" alt="Logo" style={{ width: 20, height: 20 }} />
         </div>
         <div>
           <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", letterSpacing: "-0.3px" }}>
-            Workflow Navigator
+            Telecom Workflow Navigator
           </div>
           <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 1 }}>
-            Telecom Process Intelligence
+            Operations Workflow Copilot 
           </div>
         </div>
-      </div>
-
-      {/* Status */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 6,
-        fontSize: 12, color: "var(--text-secondary)",
-        background: "var(--surface-2)", border: "1px solid var(--border)",
-        padding: "4px 10px", borderRadius: 20,
-      }}>
-        <div style={{
-          width: 7, height: 7, borderRadius: "50%",
-          background: "var(--green)",
-          boxShadow: "0 0 0 2px var(--green-bg)",
-        }} />
-        <span>Index ready</span>
       </div>
     </header>
   );

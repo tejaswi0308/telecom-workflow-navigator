@@ -2,22 +2,40 @@ import { useState } from "react";
 
 export default function MessageFeedback({ messageId, onFeedback }) {
   const [vote, setVote] = useState(null);
-  const [showComment, setShowComment] = useState(false);
+  const [showInput, setShowInput] = useState(false);
   const [commentText, setCommentText] = useState("");
   const [submitted, setSubmitted] = useState(false);
 
   function handleVote(type) {
-    const newVote = vote === type ? null : type;
-    setVote(newVote);
-    if (newVote) onFeedback({ messageId, type: newVote, comment: null });
+    // If clicking the same vote again — deselect and close
+    if (vote === type) {
+      setVote(null);
+      setShowInput(false);
+      return;
+    }
+
+    setVote(type);
+    setShowInput(true);  // immediately open comment prompt on vote
+    setSubmitted(false);
   }
 
-  function submitComment() {
-    if (!commentText.trim()) return;
-    onFeedback({ messageId, type: vote || "comment", comment: commentText });
-    setShowComment(false);
+  function handleSubmit() {
+    // Submit vote + optional comment
+    onFeedback({
+      messageId,
+      type: vote,
+      comment: commentText.trim() || null,
+    });
+    setShowInput(false);
     setSubmitted(true);
     setCommentText("");
+  }
+
+  function handleSkip() {
+    // Submit vote only, no comment
+    onFeedback({ messageId, type: vote, comment: null });
+    setShowInput(false);
+    setSubmitted(true);
   }
 
   const btnBase = {
@@ -35,47 +53,55 @@ export default function MessageFeedback({ messageId, onFeedback }) {
 
   return (
     <div>
-      {/* Vote Row */}
+      {/* Vote buttons — only 👍 and 👎, no separate 💬 */}
       <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
         <button
           style={{
-            ...btnBase,
-            ...(vote === "up" ? { background: "var(--green-bg)", borderColor: "var(--green)" } : {}),
+            ...btnBase,  
+            ...(vote === "up"
+              ? { background: "var(--green-bg)", borderColor: "var(--green)" }
+              : {}),
           }}
           onClick={() => handleVote("up")}
           title="Helpful"
-        >👍</button>
+          disabled={submitted}
+        >
+          👍
+        </button>
 
         <button
           style={{
             ...btnBase,
-            ...(vote === "down" ? { background: "var(--red-bg)", borderColor: "var(--red)" } : {}),
+            ...(vote === "down"
+              ? { background: "var(--red-bg)", borderColor: "var(--red)" }
+              : {}),
           }}
           onClick={() => handleVote("down")}
           title="Not helpful"
-        >👎</button>
-
-        <button
-          style={{
-            ...btnBase,
-            ...(showComment ? { background: "var(--accent-light)", borderColor: "var(--accent)" } : {}),
-          }}
-          onClick={() => setShowComment(s => !s)}
-          title="Add comment"
-        >💬</button>
+          disabled={submitted}
+        >
+          👎
+        </button>
 
         {submitted && (
-          <span style={{ fontSize: 11, color: "var(--green)", marginLeft: 4, display: "flex", alignItems: "center", gap: 3 }}>
-            ✓ Saved
+          <span style={{
+            fontSize: 11,
+            color: "var(--green)",
+            marginLeft: 4,
+            display: "flex",
+            alignItems: "center",
+            gap: 3,
+          }}>
+            Thanks for your feedback {":)"}
           </span>
         )}
       </div>
 
-      {/* Comment Box */}
-      {showComment && (
+      {/* Inline comment prompt — appears immediately after voting */}
+      {showInput && (
         <div style={{
           marginTop: 8,
-          maxWidth: "72%",
+          maxWidth: "480px",
           background: "var(--surface)",
           border: "1px solid var(--border)",
           borderRadius: "var(--radius-lg)",
@@ -84,19 +110,21 @@ export default function MessageFeedback({ messageId, onFeedback }) {
         }}>
           <div style={{ padding: "12px 14px" }}>
             <div style={{
-              fontSize: 11, fontWeight: 600,
-              color: "var(--text-muted)",
+              fontSize: 12,
+              color: "var(--text-secondary)",
               marginBottom: 8,
-              letterSpacing: "0.3px",
-              textTransform: "uppercase",
+              lineHeight: 1.4,
             }}>
-              Your feedback
+              {vote === "up"
+                ? "Glad it helped! Want to tell us what worked well? (optional)"
+                : "Sorry about that. What could be improved? (optional)"}
             </div>
             <textarea
-              rows={3}
-              placeholder="What could be improved?"
+              rows={2}
+              placeholder="Add a comment..."
               value={commentText}
               onChange={e => setCommentText(e.target.value)}
+              autoFocus
               style={{
                 width: "100%",
                 border: "1px solid var(--border)",
@@ -118,40 +146,46 @@ export default function MessageFeedback({ messageId, onFeedback }) {
                 e.target.style.borderColor = "var(--border)";
                 e.target.style.background = "var(--surface-2)";
               }}
+              onKeyDown={e => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSubmit();
+                }
+              }}
             />
           </div>
 
-          {/* Footer */}
           <div style={{
-            display: "flex", gap: 8,
-            padding: "10px 14px",
+            display: "flex",
+            gap: 8,
+            padding: "8px 14px",
             justifyContent: "flex-end",
             borderTop: "1px solid var(--border)",
             background: "var(--surface-2)",
           }}>
             <button
-              onClick={() => setShowComment(false)}
+              onClick={handleSkip}
               style={{
                 background: "none",
                 color: "var(--text-secondary)",
                 border: "1px solid var(--border)",
                 borderRadius: "var(--radius)",
-                padding: "6px 12px",
+                padding: "5px 12px",
                 fontSize: 12,
                 cursor: "pointer",
                 fontFamily: "var(--font)",
               }}
             >
-              Cancel
+              Skip
             </button>
             <button
-              onClick={submitComment}
+              onClick={handleSubmit}
               style={{
                 background: "var(--accent)",
                 color: "#fff",
                 border: "none",
                 borderRadius: "var(--radius)",
-                padding: "6px 16px",
+                padding: "5px 16px",
                 fontSize: 12,
                 fontWeight: 500,
                 cursor: "pointer",

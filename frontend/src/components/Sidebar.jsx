@@ -101,17 +101,17 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
       }}
     >
       {/* Loading State */}
-      {loading && (
-        <div
-          style={{
-            padding: "12px 10px",
-            fontSize: 12,
-            color: "var(--text-muted)",
-          }}
-        >
-          Loading workflows...
-        </div>
-      )}
+          {loading && (
+            <div
+              style={{
+                padding: "12px 10px",
+                fontSize: 12,
+                color: "var(--text-muted)",
+              }}
+            >
+              Loading workflows...
+            </div>
+          )}
 
       {/* Error State */}
       {error && (

@@ -121,7 +121,6 @@ export default function InputBar({ onSend, loading }) {
         marginTop: 8,
         textAlign: "center",
       }}>
-        Enter to send · Shift+Enter for new line
       </div>
     </div>
   );

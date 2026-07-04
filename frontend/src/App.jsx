@@ -58,7 +58,7 @@ export default function App() {
 
   function handleWorkflowClick(wf) {
     setActiveWorkflow(wf);
-    sendMessage(`Tell me about the ${wf}`);
+    sendMessage(`Tell me about the ${wf} workflow`);
   }
 
   async function handleNewChat() {

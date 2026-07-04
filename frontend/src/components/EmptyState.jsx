@@ -23,11 +23,10 @@ export default function EmptyState({ onSuggestionClick }) {
         boxShadow: "0 8px 28px rgba(47,56,144,0.30)",
         marginBottom: 20,
       }}>
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.8">
-          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-        </svg>
-      </div>
+                 <img src="https://img.icons8.com/?size=100&id=QhlCcbzScElq&format=png&color=ffffff" alt="Logo" style={{ width: 20, height: 20 }} />
 
+      </div>
+      
       {/* Title */}
       <div style={{
         fontSize: 18,
@@ -56,7 +55,7 @@ export default function EmptyState({ onSuggestionClick }) {
       <div style={{
         display: "grid",
         gridTemplateColumns: "1fr 1fr",
-        gap: 8,
+        gap:8,
         width: "100%",
         maxWidth: 540,
       }}>

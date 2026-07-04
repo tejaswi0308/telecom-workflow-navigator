@@ -89,7 +89,7 @@ export default function MessageBubble({ message, onFeedback }) {
         </div>
       </div>
 
-      {/* Sources — only for assistant */}
+      {/* Sources */}
       {!isUser && message.sources?.length > 0 && (
         <Sources sources={message.sources} />
       )}
