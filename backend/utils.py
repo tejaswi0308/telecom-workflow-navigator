@@ -1,5 +1,7 @@
-from pathlib import Path
+import logging
+import os
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -7,14 +9,32 @@ from langchain_community.vectorstores import FAISS
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Configuration — all tuneable via environment variables
+# ---------------------------------------------------------------------------
+EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
+EMBEDDING_DEVICE     = os.getenv("EMBEDDING_DEVICE", "cpu")
+RERANKER_MODEL       = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.5"))
+RRF_K                = int(os.getenv("RRF_K", "60"))
+
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
 def build_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(   
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        model_kwargs={"device": EMBEDDING_DEVICE},
+        encode_kwargs={"normalize_embeddings": True},  # required for cosine similarity
     )
 
 
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
 def normalize_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
@@ -24,6 +44,14 @@ def clean_section_title(title: str) -> str:
     return re.sub(r"^\d+\.\s*", "", title).strip()
 
 
+def strip_markdown_formatting(text: str) -> str:
+    """Remove markdown formatting markers (**, *, etc.) from text."""
+    return re.sub(r"\*\*(.*?)\*\*", r"\1", text).replace("*", "")
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 def get_data_directory() -> Path:
     """Returns the path to the data directory containing Markdown workflows."""
     return Path(__file__).resolve().parent.parent / "data"
@@ -34,12 +62,14 @@ def get_index_path() -> Path:
     return backend_dir.parent / "faiss_index"
 
 
+# ---------------------------------------------------------------------------
+# Vector store — cosine similarity via normalized embeddings + inner product
+# ---------------------------------------------------------------------------
 def load_vectorstore(index_path: Path) -> FAISS:
     if not index_path.exists():
         raise FileNotFoundError(
             f"FAISS index not found at {index_path}. Run ingest.py first."
         )
-
     return FAISS.load_local(
         str(index_path),
         build_embeddings(),
@@ -47,46 +77,44 @@ def load_vectorstore(index_path: Path) -> FAISS:
     )
 
 
-def strip_markdown_formatting(text: str) -> str:
-    """Remove markdown formatting markers (**, *, etc.) from text."""
-    return re.sub(r"\*\*(.*?)\*\*", r"\1", text).replace("*", "")
-
-
+# ---------------------------------------------------------------------------
+# Workflow discovery
+# ---------------------------------------------------------------------------
 _workflow_map_cache: dict[str, list[Path]] | None = None
+
 
 def scan_available_workflows() -> dict[str, list[Path]]:
     global _workflow_map_cache
     if _workflow_map_cache is not None:
         return _workflow_map_cache
-    
+
     data_dir = get_data_directory()
-    workflow_map = {}
+    workflow_map: dict[str, list[Path]] = {}
+
     if not data_dir.exists():
         return workflow_map
+
     for file_path in data_dir.glob("*.md"):
         slug = file_path.stem.lower().replace("_workflow", "")
         if slug not in workflow_map:
             workflow_map[slug] = []
         workflow_map[slug].append(file_path)
-    
+
     _workflow_map_cache = workflow_map
     return _workflow_map_cache
 
 
 def infer_workflow_type(question: str) -> str | None:
     """
-    Dynamically infers the target workflow by calculating the mathematical intersection
+    Dynamically infers the target workflow by calculating the intersection
     between the unique words in the user's query and the actual discovered filenames.
     """
     query_words = set(normalize_text(question).split())
-
     workflow_map = scan_available_workflows()
     matches: list[tuple[int, str]] = []
 
     for slug in workflow_map.keys():
-        # Split slug into words — e.g. "elevar_sr_cancellation" → {"elevar", "sr", "cancellation"}
         slug_words = set(slug.split("_"))
-
         score = len(query_words & slug_words)
         if score > 0:
             matches.append((score, slug))
@@ -94,22 +122,17 @@ def infer_workflow_type(question: str) -> str | None:
     if not matches:
         return None
 
-    # Sort primarily by token match score (descending), secondary by character length (descending)
     matches.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
 
-    # If the top match has a strictly higher token score than the second match, return it immediately
     if len(matches) == 1 or matches[0][0] > matches[1][0]:
         return matches[0][1]
 
-    # Handle a true token score tie
     if matches[0][0] == matches[1][0]:
         tied = [m for m in matches if m[0] == matches[0][0]]
-        # Prefer the longer/more specific file slug name
         tied.sort(key=lambda m: len(m[1]), reverse=True)
-        
         if len(tied[0][1]) > len(tied[1][1]):
             return tied[0][1]
-            
+
     return None
 
 
@@ -122,55 +145,131 @@ def workflow_markdown_path(workflow_type: str) -> Path | None:
         if candidate.exists():
             return candidate
 
-    # Fallback glob matching if slugs diverge slightly
     data_dir = get_data_directory()
     slug = re.sub(r"[^a-z0-9]+", "_", workflow_type.lower()).strip("_")
     matches = sorted(data_dir.glob(f"*{slug}*.md"))
     return matches[0] if matches else None
 
 
+# ---------------------------------------------------------------------------
+# Query expansion
+# ---------------------------------------------------------------------------
 def build_retrieval_queries(question: str) -> list[str]:
-    """Return neutral domain query variants to enrich dense retrieval matching."""
+    """Return domain query variants to enrich dense retrieval matching."""
     lowered = question.lower().strip()
     queries = [question]
     expansions: list[str] = []
 
-    if any(keyword in lowered for keyword in ("sop", "procedure", "workflow", "steps")):
+    if any(k in lowered for k in ("sop", "procedure", "workflow", "steps")):
         expansions.append("procedure sequencing milestones deployment steps")
 
-    if any(keyword in lowered for keyword in ("antenna", "tower", "equipment", "loading")):
+    if any(k in lowered for k in ("antenna", "tower", "equipment", "loading")):
         expansions.append("structural upgrade technical criteria physical assets verification")
 
-    if any(keyword in lowered for keyword in ("billing", "commercial", "commercial trigger", "revenue")):
+    if any(k in lowered for k in ("billing", "commercial", "commercial trigger", "revenue")):
         expansions.append("financial activation ledger sync account clearance transactional state")
 
-    if any(keyword in lowered for keyword in ("edge case", "exception", "what if", "if rejected", "fallback")):
+    if any(k in lowered for k in ("edge case", "exception", "what if", "if rejected", "fallback")):
         expansions.append("rejection routing error state condition path logic rollback loop")
 
-    if any(keyword in lowered for keyword in ("cancellation", "cancel", "termination", "tenancy")):
+    if any(k in lowered for k in ("cancellation", "cancel", "termination", "tenancy")):
         expansions.append("administrative teardown contract termination deactivation record closure")
 
-    if any(keyword in lowered for keyword in ("share", "sharing")):
+    if any(k in lowered for k in ("share", "sharing")):
         expansions.append("co-location allocation technical review parameter authorization")
 
-    if any(keyword in lowered for keyword in ("disconnect", "reconnect", "hold", "unhold")):
+    if any(k in lowered for k in ("disconnect", "reconnect", "hold", "unhold")):
         expansions.append("temporary suspension restoration status code intervention utility state")
 
-    # Approval hierarchy queries — enrich with actor and chain terminology
-    if any(keyword in lowered for keyword in ("approval", "hierarchy", "chain", "corporate", "executive", "actor", "approves", "who")):
+    if any(k in lowered for k in ("approval", "hierarchy", "chain", "corporate", "executive", "actor", "approves", "who")):
         expansions.append("approval chain actors roles authorization decision hierarchy escalation")
 
     for expansion in expansions:
-        expanded_query = f"{question} {expansion}"
-        if expanded_query not in queries:
-            queries.append(expanded_query)
+        expanded = f"{question} {expansion}"
+        if expanded not in queries:
+            queries.append(expanded)
 
     return queries
 
 
-def merge_scored_results(scored_results, top_k: int):
-    """Merge duplicate documents from multiple queries and keep the best score."""
-    best_by_key = {}
+# ---------------------------------------------------------------------------
+# BM25 retrieval
+# ---------------------------------------------------------------------------
+def build_bm25_retriever(documents: list, top_k: int):
+    """
+    Builds a BM25 keyword retriever from a list of LangChain documents.
+    Returns None if rank_bm25 is not installed.
+    """
+    try:
+        from langchain_community.retrievers import BM25Retriever
+        retriever = BM25Retriever.from_documents(documents, k=top_k)
+        return retriever
+    except ImportError:
+        logger.warning("rank_bm25 not installed — BM25 retrieval disabled. pip install rank_bm25")
+        return None
+
+
+def bm25_search(query: str, documents: list, top_k: int) -> list[tuple]:
+    """
+    Runs BM25 keyword search over documents.
+    Returns list of (document, score) tuples.
+    BM25 scores are not normalised — higher = better.
+    """
+    retriever = build_bm25_retriever(documents, top_k)
+    if retriever is None:
+        return []
+
+    results = retriever.invoke(query)
+    # BM25Retriever doesn't return scores — assign rank-based score
+    return [(doc, 1.0 / (i + 1)) for i, doc in enumerate(results)]
+
+
+# ---------------------------------------------------------------------------
+# RRF merge — combines dense + BM25 ranked lists
+# ---------------------------------------------------------------------------
+def merge_rrf(
+    all_result_lists: list[list[tuple]],
+    top_k: int,
+    k: int = RRF_K,
+) -> list[tuple]:
+    """
+    Reciprocal Rank Fusion — merges multiple ranked result lists into one.
+    Rewards documents that appear consistently across multiple retrieval systems.
+
+    Args:
+        all_result_lists: list of ranked (document, score) lists
+                          one list per retrieval system / query variant
+        top_k:            number of final results to return
+        k:                RRF smoothing constant (default 60)
+
+    Returns:
+        Merged list of (document, rrf_score) tuples, sorted best-first.
+        Higher RRF score = better.
+    """
+    rrf_scores: dict[str, float] = {}
+    doc_map: dict[str, object] = {}
+
+    for result_list in all_result_lists:
+        for rank, (document, _score) in enumerate(result_list, start=1):
+            key = (
+                document.metadata.get("workflow", ""),
+                document.page_content.strip()
+            )
+            key_str = str(key)
+            rrf_scores[key_str] = rrf_scores.get(key_str, 0.0) + 1.0 / (k + rank)
+            if key_str not in doc_map:
+                doc_map[key_str] = document
+
+    sorted_keys = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+    return [(doc_map[key], rrf_scores[key]) for key in sorted_keys[:top_k]]
+
+
+# ---------------------------------------------------------------------------
+# Legacy merge — kept for search.py and debug routes
+# ---------------------------------------------------------------------------
+def merge_scored_results(scored_results, top_k: int) -> list[tuple]:
+    """Merge duplicate documents from multiple queries — keep best L2 score."""
+    best_by_key: dict = {}
 
     for document, score in scored_results:
         workflow = document.metadata.get("workflow", "Unknown")
@@ -182,3 +281,87 @@ def merge_scored_results(scored_results, top_k: int):
 
     merged = sorted(best_by_key.values(), key=lambda item: item[1])
     return merged[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# Similarity threshold filter
+# ---------------------------------------------------------------------------
+def apply_threshold(
+    results: list[tuple],
+    threshold: float = SIMILARITY_THRESHOLD,
+    higher_is_better: bool = True,
+) -> list[tuple]:
+    """
+    Filters results by similarity score threshold.
+
+    Args:
+        results:          list of (document, score) tuples
+        threshold:        minimum acceptable score
+        higher_is_better: True for cosine/RRF (higher = better)
+                          False for L2 distance (lower = better)
+
+    Returns:
+        Filtered list. Falls back to all results if everything filtered out.
+    """
+    if higher_is_better:
+        filtered = [(doc, score) for doc, score in results if score >= threshold]
+    else:
+        filtered = [(doc, score) for doc, score in results if score <= threshold]
+
+    if not filtered:
+        logger.warning(
+            "Threshold %.2f filtered ALL results — returning unfiltered top results.", threshold
+        )
+        return results
+
+    logger.debug(
+        "Threshold %.2f kept %d/%d chunks.", threshold, len(filtered), len(results)
+    )
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# CrossEncoder reranker
+# ---------------------------------------------------------------------------
+def rerank_results(
+    question: str,
+    results: list[tuple],
+    top_k: int,
+) -> list[tuple]:
+    """
+    Reranks retrieved chunks using a CrossEncoder model.
+    CrossEncoder reads question + chunk together → more accurate relevance score.
+
+    Args:
+        question: the user's question
+        results:  list of (document, score) tuples from retrieval
+        top_k:    number of results to return after reranking
+
+    Returns:
+        Reranked list of (document, reranker_score) tuples, best-first.
+        Returns original results if sentence_transformers not installed.
+    """
+    if not results:
+        return results
+
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError:
+        logger.warning("sentence_transformers not installed — reranking disabled.")
+        return results[:top_k]
+
+    try:
+        reranker = CrossEncoder(RERANKER_MODEL)
+        pairs = [(question, doc.page_content) for doc, _ in results]
+        scores = reranker.predict(pairs)
+
+        ranked = sorted(
+            zip(results, scores),
+            key=lambda x: x[1],
+            reverse=True,  # higher CrossEncoder score = better
+        )
+        return [item[0] for item in ranked[:top_k]]
+
+    except Exception:
+        logger.exception("CrossEncoder reranking failed — returning original results.")
+        return results[:top_k]

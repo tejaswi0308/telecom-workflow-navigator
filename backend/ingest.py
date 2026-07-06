@@ -9,6 +9,9 @@ from langchain_community.vectorstores import FAISS
 
 load_dotenv()
 
+# Acronyms that .title() lowercases incorrectly
+ACRONYMS = ["Dg", "So ", "Sr "]
+
 # ── 1. Load all markdown files from data folder ──────────────────────────────
 print("Loading workflow markdown files...")
 
@@ -44,25 +47,31 @@ splitter = MarkdownHeaderTextSplitter(
 all_chunks = []
 
 for document in documents:
-    workflow_name = Path(document.metadata["source"]).stem.replace("_", " ").title()
-    workflow_slug = Path(document.metadata["source"]).stem.lower().replace("_workflow", "")
-    chunks = splitter.split_text(document.page_content)
-    for chunk in chunks:
-        chunk.metadata["workflow"] = workflow_name
-        chunk.metadata["source"] = workflow_name
-        chunk.metadata["workflow_slug"] = workflow_slug  
-        all_chunks.append(chunk)
+    stem = Path(document.metadata["source"]).stem
+    workflow_name = stem.replace("_", " ").title()
 
-# print(chunk)
-    
+    for acronym in ACRONYMS:
+        workflow_name = workflow_name.replace(acronym, acronym.upper())
+
+    workflow_slug = stem.lower().replace("_workflow", "")
+    chunks = splitter.split_text(document.page_content)
+
+    for chunk in chunks:
+        chunk.metadata["workflow"]      = workflow_name
+        chunk.metadata["source"]        = workflow_name
+        chunk.metadata["workflow_slug"] = workflow_slug
+
+    all_chunks.extend(chunks)
+
 print(f"Total chunks created: {len(all_chunks)}")
 
 # ── 3. Create embeddings ──────────────────────────────────────────────────────
 print("Loading embedding model...")
 
 embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
+    model_name="BAAI/bge-large-en-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
 )
 
 # ── 4. Store in FAISS ─────────────────────────────────────────────────────────
@@ -70,7 +79,6 @@ print("Creating FAISS vector store... this may take a minute")
 
 vectorstore = FAISS.from_documents(all_chunks, embeddings)
 
-# Save locally
 faiss_path = backend_dir.parent / "faiss_index"
 vectorstore.save_local(faiss_path)
 
