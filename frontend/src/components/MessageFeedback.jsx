@@ -7,7 +7,7 @@ export default function MessageFeedback({ messageId, onFeedback }) {
   const [submitted, setSubmitted] = useState(false);
 
   function handleVote(type) {
-    // If clicking the same vote again — deselect and close
+    // If clicking the same vote again — deselect and reset
     if (vote === type) {
       setVote(null);
       setShowInput(false);
@@ -15,8 +15,17 @@ export default function MessageFeedback({ messageId, onFeedback }) {
     }
 
     setVote(type);
-    setShowInput(true);  // immediately open comment prompt on vote
-    setSubmitted(false);
+
+    if (type === "up") {
+      // Instantly submit for positive feedback, no comment box
+      onFeedback({ messageId, type: "up", comment: null });
+      setShowInput(false);
+      setSubmitted(true);
+    } else {
+      // Open comment prompt for downvotes
+      setShowInput(true);
+      setSubmitted(false);
+    }
   }
 
   function handleSubmit() {
@@ -53,7 +62,7 @@ export default function MessageFeedback({ messageId, onFeedback }) {
 
   return (
     <div>
-      {/* Vote buttons — only 👍 and 👎, no separate 💬 */}
+      {/* Vote buttons */}
       <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
         <button
           style={{
@@ -97,7 +106,7 @@ export default function MessageFeedback({ messageId, onFeedback }) {
         )}
       </div>
 
-      {/* Inline comment prompt — appears immediately after voting */}
+      {/* Comment prompt — only triggers for downvotes now */}
       {showInput && (
         <div style={{
           marginTop: 8,
@@ -115,9 +124,7 @@ export default function MessageFeedback({ messageId, onFeedback }) {
               marginBottom: 8,
               lineHeight: 1.4,
             }}>
-              {vote === "up"
-                ? "Glad it helped! Want to tell us what worked well? (optional)"
-                : "Sorry about that. What could be improved? (optional)"}
+              Sorry about that. What could be improved? (optional)
             </div>
             <textarea
               rows={2}
