@@ -26,7 +26,7 @@ export default function App() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 8 }),
+        body: JSON.stringify({ question, top_k: 3 }),
       });
 
       const data = await res.json();
@@ -58,7 +58,7 @@ export default function App() {
 
   function handleWorkflowClick(wf) {
     setActiveWorkflow(wf);
-    sendMessage(`Tell me about the ${wf} workflow`);
+    sendMessage(`Show me the complete step-by-step process for the ${wf} workflow.`);
   }
 
   async function handleNewChat() {
