@@ -9,14 +9,18 @@ from pydantic import BaseModel, Field
 from rag import rag_answer, memory_file_path
 from utils import scan_available_workflows, get_index_path, build_embeddings
 
+# ---------------------------------------------------------------------------
 # Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
 # App
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Telecom Workflow Navigator API")
 
 app.add_middleware(
@@ -28,10 +32,12 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
 # Request / Response Models
+# ---------------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    top_k: int = Field(default=8, ge=1, le=20)
+    top_k: int = Field(default=3, ge=1, le=20)
 
 
 class SourceItem(BaseModel):
@@ -71,8 +77,9 @@ class IndexStatusResponse(BaseModel):
     memory_turns: int
 
 
-
+# ---------------------------------------------------------------------------
 # Routes
+# ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -160,7 +167,7 @@ def index_status() -> IndexStatusResponse:
     """
     index_path = get_index_path()
     embedding_model = os.getenv(
-        "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+        "EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5"
     )
 
     # Check memory turns
@@ -209,3 +216,5 @@ def index_status() -> IndexStatusResponse:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
