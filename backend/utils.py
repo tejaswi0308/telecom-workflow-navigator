@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 EMBEDDING_DEVICE     = os.getenv("EMBEDDING_DEVICE", "cpu")
 RERANKER_MODEL       = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.5"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.6"))
 RRF_K                = int(os.getenv("RRF_K", "60"))
 
 
@@ -211,17 +211,29 @@ def build_bm25_retriever(documents: list, top_k: int):
 
 def bm25_search(query: str, documents: list, top_k: int) -> list[tuple]:
     """
-    Runs BM25 keyword search over documents.
-    Returns list of (document, score) tuples.
-    BM25 scores are not normalised — higher = better.
+    Runs BM25 keyword search over documents using BM25Okapi directly.
+    Returns real BM25 scores — higher = better.
     """
-    retriever = build_bm25_retriever(documents, top_k)
-    if retriever is None:
+    if not documents:
         return []
 
-    results = retriever.invoke(query)
-    # BM25Retriever doesn't return scores — assign rank-based score
-    return [(doc, 1.0 / (i + 1)) for i, doc in enumerate(results)]
+    try:
+        from rank_bm25 import BM25Okapi
+    except ImportError:
+        logger.warning("rank_bm25 not installed — BM25 retrieval disabled. pip install rank_bm25")
+        return []
+
+    tokenized_corpus = [doc.page_content.lower().split() for doc in documents]
+    bm25 = BM25Okapi(tokenized_corpus)
+    tokenized_query = query.lower().split()
+    scores = bm25.get_scores(tokenized_query)
+
+    doc_scores = sorted(
+        zip(documents, scores),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    return [(doc, float(score)) for doc, score in doc_scores[:top_k]]
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +372,8 @@ def rerank_results(
             key=lambda x: x[1],
             reverse=True,  # higher CrossEncoder score = better
         )
-        return [item[0] for item in ranked[:top_k]]
+        # Return (document, crossencoder_score) — not original RRF score
+        return [(item[0][0], float(item[1])) for item in ranked[:top_k]]
 
     except Exception:
         logger.exception("CrossEncoder reranking failed — returning original results.")
