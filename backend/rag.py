@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,8 +11,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_groq import ChatGroq
-from langfuse import Langfuse
-from langfuse.callback import CallbackHandler
 
 from utils import (
     SIMILARITY_THRESHOLD,
@@ -381,8 +380,8 @@ def rewrite_question(
         f"Follow-up Question: {question}\n\n"
         "Standalone Question:"
     )
-    callbacks = [langfuse_handler] if langfuse_handler else []
-    response = llm.invoke(prompt, config={"callbacks": callbacks})
+    # No callbacks — avoids blank traces in Langfuse
+    response = llm.invoke(prompt, config={"callbacks": []})
     rewritten = response.content.strip()
     if verbose and rewritten and rewritten != question:
         print(f"Rewritten question: {rewritten}")
@@ -403,24 +402,24 @@ def _has_structured_content(text: str) -> bool:
 # ---------------------------------------------------------------------------
 # Langfuse setup
 # ---------------------------------------------------------------------------
-def _build_langfuse() -> tuple[Langfuse | None, CallbackHandler | None]:
+def _build_langfuse() -> tuple:
     """
-    Initialises Langfuse client and callback handler.
-    Returns (None, None) if credentials are not configured.
+    Initialises Langfuse client for manual tracing.
+    Lazy import — avoids SDK auto-init blank traces on module load.
+    Returns (client, None) if configured, (None, None) if not.
     """
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
     if not public_key or not secret_key:
         return None, None
 
+    from langfuse import Langfuse  # lazy import — only when credentials exist
     client = Langfuse(
         public_key=public_key,
         secret_key=secret_key,
         host=os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
     )
-    # CallbackHandler picks up credentials from the Langfuse singleton above
-    handler = CallbackHandler()
-    return client, handler
+    return client, None
 
 
 # ---------------------------------------------------------------------------
@@ -439,38 +438,60 @@ def rag_answer(
         "sources": [{"workflow": str, "score": float}, ...],
         "error":   str | None,
     }
-
-    Pipeline:
-        1. Load FAISS vectorstore
-        2. Load chat memory
-        3. Rewrite follow-up questions
-        4. Dense retrieval (FAISS cosine) + BM25 keyword retrieval
-        5. RRF merge of dense + BM25 results
-        6. Similarity threshold filtering
-        7. CrossEncoder reranking
-        8. LLM generation with full Langfuse tracing
     """
     # ── Langfuse setup ────────────────────────────────────────────────────
     langfuse_client, langfuse_handler = _build_langfuse()
 
-    # Start a top-level trace using the low-level SDK
     trace_id = None
-    if langfuse_client:
-        t = langfuse_client.trace(
+    trace_obj = None
+    trace_metadata: dict[str, object] = {
+        "session_id": session_id,
+        "question": question,
+        "question_length": len(question),
+        "question_word_count": len(question.split()),
+        "top_k": top_k,
+    }
+
+    def ensure_trace() -> str | None:
+        nonlocal trace_id, trace_obj
+        if trace_id or not langfuse_client:
+            return trace_id
+
+        trace_obj = langfuse_client.trace(
             name="rag_answer",
             session_id=session_id,
             input={"question": question, "top_k": top_k},
+            metadata=dict(trace_metadata),
         )
-        trace_id = t.id
+        trace_id = trace_obj.id
+        return trace_id
 
-    def log_span(name: str, input_data: dict, output_data: dict, metadata: dict | None = None):
-        """Helper to log a span to Langfuse if tracing is active."""
-        if langfuse_client and trace_id:
+    def finalize_trace(answer_text: str, sources: list[dict], extra_metadata: dict | None = None) -> None:
+        current_trace_id = ensure_trace()
+        if not langfuse_client or not current_trace_id or not trace_obj:
+            return
+
+        final_metadata = dict(trace_metadata)
+        if extra_metadata:
+            final_metadata.update(extra_metadata)
+
+        trace_obj.update(
+            metadata=final_metadata,
+            output={"answer": answer_text, "sources": sources},
+        )
+        langfuse_client.flush()
+
+    def log_span(name: str, input_data: dict, output_data: dict, start_time=None, end_time=None, metadata: dict | None = None):
+        """Helper to log a span to Langfuse if tracing is active with precise metrics."""
+        current_trace_id = ensure_trace()
+        if langfuse_client and current_trace_id:
             langfuse_client.span(
-                trace_id=trace_id,
+                trace_id=current_trace_id,
                 name=name,
                 input=input_data,
                 output=output_data,
+                start_time=start_time,
+                end_time=end_time,
                 metadata=metadata or {},
             )
 
@@ -483,17 +504,35 @@ def rag_answer(
 
     # ── 2. Load memory ────────────────────────────────────────────────────
     history = load_chat_memory()
+    trace_metadata.update(
+        {
+            "history_turns": len(history),
+            "is_follow_up_question": is_follow_up_question(question),
+            "is_explicit_topic_question": is_explicit_topic_question(question),
+        }
+    )
 
     # ── 3. Rewrite follow-up ──────────────────────────────────────────────
     standalone_question = rewrite_question(
         question, history, verbose=verbose, langfuse_handler=langfuse_handler,
     )
+    trace_metadata.update(
+        {
+            "standalone_question": standalone_question,
+            "standalone_question_length": len(standalone_question),
+            "rewritten_question": standalone_question != question,
+        }
+    )
 
-    if trace_id and standalone_question != question:
+    if standalone_question != question:
         log_span(
             "question_rewrite",
             input_data={"original": question},
             output_data={"rewritten": standalone_question},
+            metadata={
+                "rewrite_applied": True,
+                "rewrite_reason": "follow_up_question",
+            },
         )
 
     if (
@@ -505,15 +544,25 @@ def rag_answer(
             "I'm sorry, but your question refers to a previous topic and there is no "
             "active chat history. Could you please specify which workflow you are asking about?"
         )
+        finalize_trace(answer, [], extra_metadata={"answer_mode": "follow_up_without_history"})
         return {"answer": answer, "sources": [], "error": None}
 
     # ── 4. Workflow routing ───────────────────────────────────────────────
     inferred_wf = infer_workflow_type(question) or infer_workflow_type(standalone_question)
+    trace_metadata.update(
+        {
+            "inferred_workflow": inferred_wf,
+            "standalone_question_is_follow_up": is_follow_up_question(standalone_question),
+            "standalone_question_is_explicit_topic": is_explicit_topic_question(standalone_question),
+        }
+    )
     if verbose and inferred_wf:
         print(f"Router → target slug: {inferred_wf}")
 
-    # ── 5. Dense retrieval (FAISS cosine) ─────────────────────────────────
+    # ── 5. Dense retrieval (FAISS cosine) + threshold ────────────────────
+    t_dense_start = datetime.now(timezone.utc)
     candidate_k = max(top_k * 5, top_k + 10)
+    trace_metadata["candidate_k"] = candidate_k
     dense_candidates: list[tuple] = []
 
     for retrieval_query in build_retrieval_queries(standalone_question):
@@ -529,136 +578,143 @@ def rag_answer(
         ]
         dense_candidates = filtered_dense if filtered_dense else dense_candidates
 
-    # Deduplicate dense candidates keeping best score
+    # Deduplicate keeping best cosine score per chunk
     seen_dense: dict[str, tuple] = {}
     for doc, score in dense_candidates:
         key = doc.page_content.strip()
-        if key not in seen_dense or score > seen_dense[key][1]:  # higher = better (cosine)
+        if key not in seen_dense or score > seen_dense[key][1]:
             seen_dense[key] = (doc, score)
-    dense_results = sorted(seen_dense.values(), key=lambda x: x[1], reverse=True)[:candidate_k]
+    dense_deduped = sorted(seen_dense.values(), key=lambda x: x[1], reverse=True)
+    trace_metadata["dense_candidate_count"] = len(dense_candidates)
+    trace_metadata["dense_deduped_count"] = len(dense_deduped)
 
-    # Apply threshold on cosine similarity scores — before RRF merge
-    # Filters out chunks that are not similar enough to the query
-    pre_threshold_count = len(dense_results)
+    # Apply cosine similarity threshold AFTER dedup
+    pre_threshold_count = len(dense_deduped)
     dense_results = apply_threshold(
-        dense_results,
+        dense_deduped,
         threshold=SIMILARITY_THRESHOLD,
-        higher_is_better=True,  # cosine — higher is better
+        higher_is_better=True,
     )
-    logger.debug(
-        "Cosine threshold %.2f: kept %d/%d dense chunks.",
-        SIMILARITY_THRESHOLD, len(dense_results), pre_threshold_count,
-    )
+    trace_metadata["dense_result_count"] = len(dense_results)
+    t_dense_end = datetime.now(timezone.utc)
 
-    # Log dense retrieval to Langfuse
+    # ── 6. BM25 retrieval (independent) ──────────────────────────────────
+    t_bm25_start = datetime.now(timezone.utc)
+    all_docs_only = [doc for doc, _ in dense_deduped]
+    bm25_results = bm25_search(standalone_question, all_docs_only, top_k=candidate_k)
+    trace_metadata["bm25_result_count"] = len(bm25_results)
+    t_bm25_end = datetime.now(timezone.utc)
+
+    # ── 7. RRF merge (dense + BM25) ───────────────────────────────────────
+    t_rrf_start = datetime.now(timezone.utc)
+    merged_results = merge_rrf(
+        [dense_results, bm25_results],
+        top_k=10,
+    )
+    trace_metadata["merged_result_count"] = len(merged_results)
+    t_rrf_end = datetime.now(timezone.utc)
+
+    if not merged_results:
+        answer = "No relevant context found."
+        finalize_trace(answer, [], extra_metadata={"answer_mode": "no_context"})
+        return {"answer": answer, "sources": [], "error": None}
+
+    # ── 8. CrossEncoder reranking ─────────────────────────────────────────
+    t_rerank_start = datetime.now(timezone.utc)
+    reranked_results = rerank_results(standalone_question, merged_results, top_k=top_k)
+
+    results = reranked_results
+    trace_metadata["reranked_result_count"] = len(results)
+    t_rerank_end = datetime.now(timezone.utc)
+
+    # ── Log all retrieval spans WITH exact performance timestamps ─────────
     log_span(
         "dense_retrieval",
-        input_data={"query": standalone_question, "candidate_k": candidate_k},
+        input_data={
+            "query": standalone_question,
+            "candidate_k": candidate_k,
+            "threshold": SIMILARITY_THRESHOLD,
+        },
         output_data={
+            "total_before_threshold": pre_threshold_count,
+            "total_after_threshold": len(dense_results),
             "chunks": [
                 {
+                    "rank": i + 1,
                     "workflow": doc.metadata.get("workflow", "Unknown"),
-                    "score": round(float(score), 4),
+                    "cosine_score": round(float(score), 4),
                     "preview": doc.page_content[:200],
                 }
-                for doc, score in dense_results[:top_k]
-            ]
+                for i, (doc, score) in enumerate(dense_results[:top_k])
+            ],
         },
+        start_time=t_dense_start,
+        end_time=t_dense_end,
         metadata={"retrieval_type": "dense_cosine", "inferred_workflow": inferred_wf},
     )
 
-    # ── 6. BM25 retrieval ─────────────────────────────────────────────────
-    # Get all documents from vectorstore for BM25
-    all_docs = [doc for doc, _ in dense_candidates]
-    bm25_results = bm25_search(standalone_question, all_docs, top_k=candidate_k)
-
-    # Log BM25 retrieval to Langfuse
     log_span(
         "bm25_retrieval",
-        input_data={"query": standalone_question},
+        input_data={"query": standalone_question, "total_docs": len(all_docs_only)},
         output_data={
+            "total_results": len(bm25_results),
             "chunks": [
                 {
+                    "rank": i + 1,
                     "workflow": doc.metadata.get("workflow", "Unknown"),
-                    "score": round(float(score), 4),
+                    "bm25_score": round(float(score), 4),
                     "preview": doc.page_content[:200],
                 }
-                for doc, score in bm25_results[:top_k]
-            ]
+                for i, (doc, score) in enumerate(bm25_results[:top_k])
+            ],
         },
+        start_time=t_dense_end,
+        end_time=t_bm25_end,
         metadata={"retrieval_type": "bm25_keyword"},
-    )
-
-    # ── 7. RRF merge ──────────────────────────────────────────────────────
-    merged_results = merge_rrf(
-        [dense_results, bm25_results],
-        top_k=candidate_k,
     )
 
     log_span(
         "rrf_merge",
         input_data={
-            "dense_count": len(dense_results),
-            "bm25_count": len(bm25_results),
+            "dense_chunks": len(dense_results),
+            "bm25_chunks": len(bm25_results),
         },
         output_data={
             "merged_count": len(merged_results),
             "top_chunks": [
                 {
+                    "rank": i + 1,
                     "workflow": doc.metadata.get("workflow", "Unknown"),
                     "rrf_score": round(float(score), 6),
                 }
-                for doc, score in merged_results[:top_k]
+                for i, (doc, score) in enumerate(merged_results[:top_k])
             ],
         },
+        start_time=t_bm25_end,
+        end_time=t_rrf_end,
     )
-
-    # ── 8. Threshold logging in Langfuse ─────────────────────────────────
-    # Threshold was already applied on cosine scores before RRF merge.
-    # Here we just log the score distribution for observability.
-    above = [(doc, score) for doc, score in merged_results if score >= SIMILARITY_THRESHOLD]
-    below = [(doc, score) for doc, score in merged_results if score < SIMILARITY_THRESHOLD]
-
-    log_span(
-        "threshold_analysis",
-        input_data={"reference_threshold": SIMILARITY_THRESHOLD},
-        output_data={
-            "total_chunks": len(merged_results),
-            "above_threshold": [
-                {"workflow": doc.metadata.get("workflow", "Unknown"), "score": round(float(s), 6)}
-                for doc, s in above
-            ],
-            "below_threshold": [
-                {"workflow": doc.metadata.get("workflow", "Unknown"), "score": round(float(s), 6)}
-                for doc, s in below
-            ],
-        },
-        metadata={"chunks_above": len(above), "chunks_below": len(below)},
-    )
-
-    if not merged_results:
-        return {"answer": "No relevant context found.", "sources": [], "error": None}
-
-    # ── 9. CrossEncoder reranking ─────────────────────────────────────────
-    reranked_results = rerank_results(standalone_question, merged_results, top_k=top_k)
 
     log_span(
         "crossencoder_rerank",
-        input_data={"question": standalone_question, "chunks_in": len(merged_results)},
+        input_data={
+            "question": standalone_question,
+            "chunks_in": len(merged_results),
+            "top_k": 3,
+        },
         output_data={
-            "final_chunks": [
+            "final_top_k_chunks": [
                 {
                     "rank": i + 1,
                     "workflow": doc.metadata.get("workflow", "Unknown"),
-                    "reranker_score": round(float(score), 4),
-                    "preview": doc.page_content[:200],
+                    "crossencoder_score": round(float(score), 4),
+                    "content": doc.page_content[:300],
                 }
                 for i, (doc, score) in enumerate(reranked_results)
             ]
         },
+        start_time=t_rrf_end,
+        end_time=t_rerank_end,
     )
-
-    results = reranked_results
 
     # ── 10. Direct answer parser (simple list questions) ──────────────────
     use_direct_parser = (
@@ -669,6 +725,7 @@ def rag_answer(
         )
         and not is_complex_query(standalone_question)
     )
+    trace_metadata["use_direct_parser"] = use_direct_parser
 
     if use_direct_parser:
         direct_answer = build_process_direct_answer(standalone_question, results)
@@ -682,6 +739,14 @@ def rag_answer(
                 for doc, score in results
                 if doc.metadata.get("workflow") == matched_workflow
             ]
+            finalize_trace(
+                answer_text,
+                sources,
+                extra_metadata={
+                    "answer_mode": "direct_parser",
+                    "matched_workflow": matched_workflow,
+                },
+            )
             return {"answer": answer_text, "sources": sources, "error": None}
 
     # ── 11. LLM generation ────────────────────────────────────────────────
@@ -701,13 +766,31 @@ def rag_answer(
         "Answer:"
     )
 
-    callbacks = [langfuse_handler] if langfuse_handler else []
+    # Log exact context sent to LLM — BEFORE calling LLM
+    log_span(
+        "context_sent_to_llm",
+        input_data={"question": standalone_question},
+        output_data={
+            "final_chunks_count": len(results),
+            "chunks": [
+                {
+                    "rank": i + 1,
+                    "workflow": doc.metadata.get("workflow", "Unknown"),
+                    "crossencoder_score": round(float(score), 4),
+                    "content": doc.page_content.strip(),
+                }
+                for i, (doc, score) in enumerate(results)
+            ],
+            "full_context": context,
+        },
+    )
 
     # Generation span — LLM-specific with all characteristics
-    generation_id = None
-    if langfuse_client and trace_id:
-        gen = langfuse_client.generation(
-            trace_id=trace_id,
+    generation_client = None
+    current_trace_id = ensure_trace()
+    if langfuse_client and current_trace_id:
+        generation_client = langfuse_client.generation(
+            trace_id=current_trace_id,
             name="llm_generation",
             model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
             model_parameters={
@@ -715,23 +798,32 @@ def rag_answer(
                 "top_k": top_k,
             },
             input=prompt,
+            metadata={
+                "session_id": session_id,
+                "history_turns": len(history),
+                "inferred_workflow": inferred_wf,
+                "candidate_k": candidate_k,
+                "dense_result_count": len(dense_results),
+                "bm25_result_count": len(bm25_results),
+                "merged_result_count": len(merged_results),
+                "reranked_result_count": len(results),
+                "use_direct_parser": use_direct_parser,
+            },
         )
-        generation_id = gen.id
 
-    response = llm.invoke(prompt, config={"callbacks": callbacks})
+    response = llm.invoke(prompt, config={"callbacks": []})
     answer = response.content.strip()
 
-    # Log token usage to Langfuse generation span
-    if langfuse_client and generation_id:
-        usage = getattr(response, "usage_metadata", None)
-        langfuse_client.generation(
-            id=generation_id,
+    # Log token usage
+    if generation_client:
+        token_usage = response.response_metadata.get("token_usage", {})
+        generation_client.update(
             output=answer,
             usage={
-                "input":  getattr(usage, "input_tokens", None),
-                "output": getattr(usage, "output_tokens", None),
-                "total":  getattr(usage, "total_tokens", None),
-            } if usage else {},
+                "input": token_usage.get("prompt_tokens"),
+                "output": token_usage.get("completion_tokens"),
+                "total": token_usage.get("total_tokens"),
+            },
         )
 
     # Strip citations [1], [2] from answer just in case LLM still adds them
@@ -755,12 +847,15 @@ def rag_answer(
         sources.append({"workflow": workflow, "score": float(score)})
 
     # Finalise trace
-    if langfuse_client and trace_id:
-        langfuse_client.trace(
-            id=trace_id,
-            output={"answer": answer_clean, "sources": sources},
-        )
-        langfuse_client.flush()
+    finalize_trace(
+        answer_clean,
+        sources,
+        extra_metadata={
+            "answer_mode": "llm",
+            "answer_length": len(answer_clean),
+            "source_count": len(sources),
+        },
+    )
 
     return {"answer": answer_clean, "sources": sources, "error": None}
 
