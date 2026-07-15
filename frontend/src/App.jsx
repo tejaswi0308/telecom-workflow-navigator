@@ -1,12 +1,63 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Header from "./components/Header.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import ChatArea from "./components/ChatArea.jsx";
 
+// ---------------------------------------------------------------------------
+// sessionStorage keys — chat state persists across reloads within the SAME TAB only —
+// closing the tab clears it (sessionStorage), and it also resets on
+// "New Chat"
+// ---------------------------------------------------------------------------
+const SESSION_ID_KEY = "twn_session_id";
+const MESSAGES_KEY = "twn_messages";
+const ACTIVE_WORKFLOW_KEY = "twn_active_workflow";
+
+function loadOrCreateSessionId() {
+  let id = sessionStorage.getItem(SESSION_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(SESSION_ID_KEY, id);
+  }
+  return id;
+}
+
+function loadStoredMessages() {
+  try {
+    const raw = sessionStorage.getItem(MESSAGES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // time was serialized as an ISO string — convert back to Date objects
+    return parsed.map(m => ({ ...m, time: new Date(m.time) }));
+  } catch {
+    return [];
+  }
+}
+
+function loadStoredActiveWorkflow() {
+  return sessionStorage.getItem(ACTIVE_WORKFLOW_KEY) || null;
+}
+
 export default function App() {
-  const [messages, setMessages] = useState([]);
+  // Lazy initializers — run once on mount, read whatever was saved before reload
+  const [sessionId, setSessionId] = useState(loadOrCreateSessionId);
+  const [messages, setMessages] = useState(loadStoredMessages);
   const [loading, setLoading] = useState(false);
-  const [activeWorkflow, setActiveWorkflow] = useState(null);
+  const [activeWorkflow, setActiveWorkflow] = useState(loadStoredActiveWorkflow);
+
+  // Persist messages whenever they change
+  useEffect(() => {
+    sessionStorage.setItem(MESSAGES_KEY, JSON.stringify(messages));
+  }, [messages]);
+
+  // Persist active workflow whenever it changes
+  useEffect(() => {
+    if (activeWorkflow) {
+      sessionStorage.setItem(ACTIVE_WORKFLOW_KEY, activeWorkflow);
+    } else {
+      sessionStorage.removeItem(ACTIVE_WORKFLOW_KEY);
+    }
+  }, [activeWorkflow]);
 
   async function sendMessage(text) {
     const question = text.trim();
@@ -26,7 +77,7 @@ export default function App() {
       const res = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, top_k: 3 }),
+        body: JSON.stringify({ question, session_id: sessionId }),
       });
 
       const data = await res.json();
@@ -58,18 +109,31 @@ export default function App() {
 
   function handleWorkflowClick(wf) {
     setActiveWorkflow(wf);
-    sendMessage(`Show me the complete step-by-step process for the ${wf} workflow.`);
+    sendMessage(`What are the steps in the ${wf} workflow?`);
   }
 
   async function handleNewChat() {
+    const endingSessionId = sessionId;
+
     // Clear frontend state
     setMessages([]);
     setActiveWorkflow(null);
 
-    // Clear server-side memory so next conversation
-    // starts with a completely clean context window
+    // Clear persisted state so a reload doesn't bring the old chat back
+    sessionStorage.removeItem(MESSAGES_KEY);
+    sessionStorage.removeItem(ACTIVE_WORKFLOW_KEY);
+
+    // Start a brand new Langfuse session for the next conversation
+    const newSessionId = crypto.randomUUID();
+    sessionStorage.setItem(SESSION_ID_KEY, newSessionId);
+    setSessionId(newSessionId);
+
+    // Clear server-side memory for the session that's ending — this only
+    // wipes that one session's file, not any other user's/session's history
     try {
-      await fetch("/api/history", { method: "DELETE" });
+      await fetch(`/api/history?session_id=${encodeURIComponent(endingSessionId)}`, {
+        method: "DELETE",
+      });
     } catch {
       // non-critical — UI is already cleared
       console.warn("Could not clear server-side chat history.");
@@ -77,6 +141,22 @@ export default function App() {
   }
 
   async function handleFeedback(feedback) {
+    // message_id is just a client-side Date.now() tag — meaningless on its
+    // own. Look up the actual answer text, and the user question that came
+    // right before it, so the feedback row in SQLite is self-explanatory.
+    const assistantIndex = messages.findIndex(
+      m => String(m.id) === String(feedback.messageId)
+    );
+    const answerMsg = assistantIndex !== -1 ? messages[assistantIndex] : null;
+
+    let questionText = null;
+    for (let i = assistantIndex - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        questionText = messages[i].text;
+        break;
+      }
+    }
+
     try {
       await fetch("/api/feedback", {
         method: "POST",
@@ -85,6 +165,9 @@ export default function App() {
           message_id: String(feedback.messageId),
           type: feedback.type,
           comment: feedback.comment || null,
+          session_id: sessionId,
+          question: questionText,
+          answer: answerMsg ? answerMsg.text : null,
         }),
       });
     } catch {
