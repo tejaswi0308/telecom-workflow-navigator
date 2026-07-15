@@ -8,3 +8,9 @@ backend/rag_memory.json
 # 2. Ignore root level folders 
 faiss_index/
 data/
+
+# 3. Ignore the app data database file
+backend/app_data.db
+
+# 4. Conversation memory files
+backend/memory/
