@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 EMBEDDING_DEVICE     = os.getenv("EMBEDDING_DEVICE", "cpu")
 RERANKER_MODEL       = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.6"))
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.7"))
 RRF_K                = int(os.getenv("RRF_K", "60"))
 
 
@@ -335,6 +335,25 @@ def apply_threshold(
 # ---------------------------------------------------------------------------
 # CrossEncoder reranker
 # ---------------------------------------------------------------------------
+_reranker_cache = None  # loaded once, reused across all requests (see _get_reranker)
+
+
+def _get_reranker():
+    """
+    Lazily loads and caches the CrossEncoder reranker model.
+    Loading this model from disk takes several seconds to tens of seconds —
+    doing it once at first use (instead of on every request) is what keeps
+    reranking fast after the initial warm-up.
+    """
+    global _reranker_cache
+    if _reranker_cache is None:
+        from sentence_transformers import CrossEncoder
+        logger.info("Loading CrossEncoder reranker model '%s' (one-time load)...", RERANKER_MODEL)
+        _reranker_cache = CrossEncoder(RERANKER_MODEL)
+        logger.info("CrossEncoder reranker model loaded and cached.")
+    return _reranker_cache
+
+
 def rerank_results(
     question: str,
     results: list[tuple],
@@ -357,13 +376,15 @@ def rerank_results(
         return results
 
     try:
-        from sentence_transformers import CrossEncoder
+        reranker = _get_reranker()
     except ImportError:
         logger.warning("sentence_transformers not installed — reranking disabled.")
         return results[:top_k]
+    except Exception:
+        logger.exception("Failed to load CrossEncoder reranker model — returning original results.")
+        return results[:top_k]
 
     try:
-        reranker = CrossEncoder(RERANKER_MODEL)
         pairs = [(question, doc.page_content) for doc, _ in results]
         scores = reranker.predict(pairs)
 

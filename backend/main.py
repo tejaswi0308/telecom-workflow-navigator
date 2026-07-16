@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from rag import rag_answer, memory_file_path
 from utils import scan_available_workflows, get_index_path, build_embeddings
+import db
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -32,12 +33,22 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def on_startup() -> None:
+    db.init_db()
+    logger.info("SQLite database ready at %s", db.DB_PATH)
+
+
 # ---------------------------------------------------------------------------
 # Request / Response Models
 # ---------------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k: int = Field(default=3, ge=1, le=20)
+    session_id: str = Field(
+        default="default",
+        description="Frontend-generated session id, forwarded to Langfuse for trace grouping.",
+    )
 
 
 class SourceItem(BaseModel):
@@ -54,10 +65,30 @@ class FeedbackRequest(BaseModel):
     message_id: str = Field(..., description="Frontend-generated id for the message")
     type: str = Field(..., description="'up', 'down', or 'comment'")
     comment: str | None = Field(default=None)
+    session_id: str = Field(default="default", description="Session this feedback belongs to")
+    question: str | None = Field(default=None, description="The user question this feedback is about")
+    answer: str | None = Field(default=None, description="The assistant answer this feedback is about")
 
 
 class FeedbackResponse(BaseModel):
     status: str
+    id: int | None = None
+
+
+class FeedbackItem(BaseModel):
+    id: int
+    session_id: str
+    message_id: str
+    type: str
+    comment: str | None
+    question: str | None
+    answer: str | None
+    created_at: str
+
+
+class FeedbackListResponse(BaseModel):
+    feedback: list[FeedbackItem]
+    counts: dict[str, int]
 
 
 class WorkflowsResponse(BaseModel):
@@ -91,10 +122,16 @@ def ask(payload: AskRequest) -> AskResponse:
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    logger.info("Received question: %s", question)
+    logger.info(
+        "Received question: %s | session_id=%s", question, payload.session_id
+    )
 
     try:
-        result = rag_answer(question, top_k=payload.top_k)
+        result = rag_answer(
+            question,
+            top_k=payload.top_k,
+            session_id=payload.session_id,
+        )
     except Exception:
         logger.exception("rag_answer() failed for question: %s", question)
         raise HTTPException(status_code=500, detail="Something went wrong while answering the question.")
@@ -123,55 +160,83 @@ def get_workflows() -> WorkflowsResponse:
 
 @app.post("/api/feedback", response_model=FeedbackResponse)
 def submit_feedback(payload: FeedbackRequest) -> FeedbackResponse:
-    """Accepts user feedback on a message. Logs it now, wire to DB later."""
+    """Accepts user feedback on a message and persists it to SQLite."""
     if payload.type not in ("up", "down", "comment"):
         raise HTTPException(status_code=400, detail="type must be 'up', 'down', or 'comment'.")
 
     logger.info(
-        "Feedback | message_id=%s | type=%s | comment=%s",
+        "Feedback | session_id=%s | message_id=%s | type=%s | comment=%s",
+        payload.session_id,
         payload.message_id,
         payload.type,
         payload.comment,
     )
 
-    # TODO: persist to database once connected
-    return FeedbackResponse(status="received")
+    try:
+        new_id = db.insert_feedback(
+            session_id=payload.session_id,
+            message_id=payload.message_id,
+            type_=payload.type,
+            comment=payload.comment,
+            question=payload.question,
+            answer=payload.answer,
+        )
+    except Exception:
+        logger.exception("Failed to persist feedback to SQLite.")
+        raise HTTPException(status_code=500, detail="Could not save feedback.")
+
+    return FeedbackResponse(status="received", id=new_id)
+
+
+@app.get("/api/feedback", response_model=FeedbackListResponse)
+def list_feedback(session_id: str | None = None, limit: int = 100) -> FeedbackListResponse:
+    """
+    Returns recent feedback, newest first. Pass ?session_id=... to see one
+    conversation's feedback only; omit it to see everything (demo/admin view).
+    """
+    rows = db.fetch_feedback(session_id=session_id, limit=limit)
+    counts = db.feedback_counts()
+    return FeedbackListResponse(feedback=rows, counts=counts)
 
 
 @app.delete("/api/history", response_model=HistoryResponse)
-def clear_history() -> HistoryResponse:
+def clear_history(session_id: str = "default") -> HistoryResponse:
     """
-    Clears the server-side chat memory (rag_memory.json).
+    Clears the server-side chat memory for one session only
+    (memory/rag_memory_<session_id>.json). Other users' / other
+    sessions' history is untouched.
     Called when user clicks New Chat so the next conversation
     starts with a completely clean context window.
     """
-    path = memory_file_path()
+    path = memory_file_path(session_id)
     try:
         if path.exists():
             path.write_text("[]", encoding="utf-8")
-            logger.info("Chat memory cleared.")
+            logger.info("Chat memory cleared for session_id=%s", session_id)
         else:
-            logger.info("Chat memory file does not exist — nothing to clear.")
+            logger.info("No chat memory found for session_id=%s — nothing to clear.", session_id)
     except Exception:
-        logger.exception("Failed to clear chat memory.")
+        logger.exception("Failed to clear chat memory for session_id=%s", session_id)
         raise HTTPException(status_code=500, detail="Could not clear chat history.")
 
     return HistoryResponse(status="cleared")
 
 
 @app.get("/api/index/status", response_model=IndexStatusResponse)
-def index_status() -> IndexStatusResponse:
+def index_status(session_id: str = "default") -> IndexStatusResponse:
     """
     Returns real information about the FAISS index.
     Powers the header status badge and is useful for the panel demo.
+    memory_turns reflects the given session's memory file (defaults to
+    the "default" session if none is passed).
     """
     index_path = get_index_path()
     embedding_model = os.getenv(
         "EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5"
     )
 
-    # Check memory turns
-    memory_path = memory_file_path()
+    # Check memory turns for this session
+    memory_path = memory_file_path(session_id)
     memory_turns = 0
     if memory_path.exists():
         import json
@@ -216,5 +281,3 @@ def index_status() -> IndexStatusResponse:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-

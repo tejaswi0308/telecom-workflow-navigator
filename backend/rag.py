@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 
 from utils import (
     SIMILARITY_THRESHOLD,
@@ -63,9 +64,48 @@ COMPLEX_QUERY_HINTS = (
 # ---------------------------------------------------------------------------
 # LLM builder
 # ---------------------------------------------------------------------------
-def build_llm() -> ChatGroq:
-    model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-    return ChatGroq(model=model_name, temperature=TEMPERATURE)
+def build_llm():
+    """
+    Builds the chat LLM based on LLM_PROVIDER env var:
+      LLM_PROVIDER=azure  -> ChatOpenAI pointed at Azure's v1 unified endpoint
+                             (org credentials, e.g. *.services.ai.azure.com/openai/v1)
+      LLM_PROVIDER=groq   -> ChatGroq (fallback / local dev)
+    Defaults to "azure".
+    """
+    provider = os.getenv("LLM_PROVIDER", "azure").lower()
+
+    if provider == "azure":
+        required_vars = [
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT",
+            "AZURE_OPENAI_DEPLOYMENT_NAME",
+        ]
+        missing = [v for v in required_vars if not os.getenv(v)]
+        if missing:
+            raise RuntimeError(
+                f"LLM_PROVIDER=azure but missing env vars: {', '.join(missing)}. "
+                "Check your .env file."
+            )
+        return ChatOpenAI(
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            temperature=TEMPERATURE,
+        )
+
+    if provider == "groq":
+        model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        return ChatGroq(model=model_name, temperature=TEMPERATURE)
+
+    raise ValueError(f"Unknown LLM_PROVIDER '{provider}'. Use 'azure' or 'groq'.")
+
+
+def current_model_name() -> str:
+    """Returns the active model/deployment name, for Langfuse generation logging."""
+    provider = os.getenv("LLM_PROVIDER", "azure").lower()
+    if provider == "azure":
+        return os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "azure-openai")
+    return os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +127,33 @@ def format_context(results: list[tuple]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Memory — file based (will be replaced by DB in DB track)
+# Memory — file based, one file per session (will be replaced by DB in DB track)
 # ---------------------------------------------------------------------------
-def memory_file_path() -> Path:
-    return Path(__file__).resolve().parent / "rag_memory.json"
+_SAFE_SESSION_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 
-def load_chat_memory() -> list[dict[str, str]]:
-    path = memory_file_path()
+def _sanitize_session_id(session_id: str) -> str:
+    """
+    Prevents path traversal / invalid filenames. Falls back to 'default'
+    if the sanitized id is empty.
+    """
+    cleaned = _SAFE_SESSION_ID_RE.sub("_", str(session_id or "").strip())
+    return cleaned or "default"
+
+
+def memory_dir_path() -> Path:
+    directory = Path(__file__).resolve().parent / "memory"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def memory_file_path(session_id: str = "default") -> Path:
+    safe_id = _sanitize_session_id(session_id)
+    return memory_dir_path() / f"rag_memory_{safe_id}.json"
+
+
+def load_chat_memory(session_id: str = "default") -> list[dict[str, str]]:
+    path = memory_file_path(session_id)
     if not path.exists():
         return []
     try:
@@ -110,8 +169,8 @@ def load_chat_memory() -> list[dict[str, str]]:
     return turns
 
 
-def save_chat_memory(turns: list[dict[str, str]]) -> None:
-    path = memory_file_path()
+def save_chat_memory(turns: list[dict[str, str]], session_id: str = "default") -> None:
+    path = memory_file_path(session_id)
     path.write_text(json.dumps(turns[-MEMORY_TURNS:], indent=2), encoding="utf-8")
 
 
@@ -503,7 +562,7 @@ def rag_answer(
         return {"answer": str(exc), "sources": [], "error": "index_not_found"}
 
     # ── 2. Load memory ────────────────────────────────────────────────────
-    history = load_chat_memory()
+    history = load_chat_memory(session_id)
     trace_metadata.update(
         {
             "history_turns": len(history),
@@ -732,7 +791,7 @@ def rag_answer(
         if direct_answer:
             answer_text, matched_workflow = direct_answer
             history.append({"user": question, "assistant": answer_text})
-            save_chat_memory(history)
+            save_chat_memory(history, session_id)
 
             sources = [
                 {"workflow": doc.metadata.get("workflow", "Unknown"), "score": float(score)}
@@ -792,7 +851,7 @@ def rag_answer(
         generation_client = langfuse_client.generation(
             trace_id=current_trace_id,
             name="llm_generation",
-            model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            model=current_model_name(),
             model_parameters={
                 "temperature": TEMPERATURE,
                 "top_k": top_k,
@@ -835,7 +894,7 @@ def rag_answer(
         answer_clean = strip_markdown_formatting(answer)
 
     history.append({"user": question, "assistant": answer_clean})
-    save_chat_memory(history)
+    save_chat_memory(history, session_id)
 
     sources = []
     seen: set[str] = set()
