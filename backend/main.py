@@ -6,7 +6,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from rag import rag_answer, memory_file_path
+from rag import rag_answer
+from memory import memory_file_path
 from utils import scan_available_workflows, get_index_path, build_embeddings
 import db
 
