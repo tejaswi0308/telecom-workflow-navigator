@@ -5,6 +5,7 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
 
 
 load_dotenv()
@@ -77,7 +78,10 @@ embeddings = HuggingFaceEmbeddings(
 # ── 4. Store in FAISS ─────────────────────────────────────────────────────────
 print("Creating FAISS vector store... this may take a minute")
 
-vectorstore = FAISS.from_documents(all_chunks, embeddings)
+vectorstore = FAISS.from_documents(
+    all_chunks, embeddings,
+    distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
+)
 
 faiss_path = backend_dir.parent / "faiss_index"
 vectorstore.save_local(faiss_path)
