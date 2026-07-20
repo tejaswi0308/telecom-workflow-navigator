@@ -53,7 +53,7 @@ export default function InputBar({ onSend, loading }) {
         <div style={{
           display: "flex",
           alignItems: "flex-end",
-          padding: "10px 12px 10px 16px",
+          padding: "13px 14px 13px 20px",
           gap: 10,
         }}>
           <textarea
@@ -91,18 +91,18 @@ export default function InputBar({ onSend, loading }) {
               justifyContent: "center",
               flexShrink: 0,
               alignSelf: "flex-end",
-              boxShadow: "0 2px 8px rgba(47,56,144,0.30)",
+              boxShadow: "var(--accent-glow)",
               opacity: loading ? 0.35 : 1,
               transition: "opacity var(--transition), box-shadow var(--transition), transform var(--transition)",
             }}
             onMouseEnter={e => {
               if (!loading) {
-                e.currentTarget.style.boxShadow = "0 4px 14px rgba(47,56,144,0.40)";
+                e.currentTarget.style.boxShadow = "0 8px 24px rgba(79,70,229,0.45)";
                 e.currentTarget.style.transform = "translateY(-1px)";
               }
             }}
             onMouseLeave={e => {
-              e.currentTarget.style.boxShadow = "0 2px 8px rgba(47,56,144,0.30)";
+              e.currentTarget.style.boxShadow = "var(--accent-glow)";
               e.currentTarget.style.transform = "translateY(0)";
             }}
           >

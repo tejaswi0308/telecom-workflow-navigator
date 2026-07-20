@@ -25,67 +25,65 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
 
   <aside
     style={{
-      width: "var(--sidebar-w)",
+      width: "100%",
+      flex: 1,
+      minHeight: 0,
       background: "var(--surface)",
-      borderRight: "1px solid var(--border)",
       display: "flex",
       flexDirection: "column",
       overflow: "hidden",
-      flexShrink: 0,
     }}
   >
     {/* New Chat Button */}
-    <div style={{ padding: "14px 12px 10px" }}>
+    <div style={{ padding: "18px 14px 14px" }}>
       <button
         onClick={onNewChat}
         style={{
           width: "100%",
-          padding: "9px 14px",
+          padding: "14px 13px",
           background:
             "linear-gradient(135deg, var(--accent) 0%, var(--accent-mid) 100%)",
           color: "#fff",
           border: "none",
-          borderRadius: "var(--radius)",
-          fontSize: 13,
+          borderRadius: "var(--radius-lg)",
+          fontSize: 13.5,
           fontWeight: 500,
           cursor: "pointer",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          gap: 7,
-          boxShadow: "0 2px 8px rgba(47,56,144,0.25)",
+          gap: 8,
+          boxShadow: "var(--accent-glow)",
           letterSpacing: "-0.1px",
           fontFamily: "var(--font)",
+          transition: "transform var(--transition), box-shadow var(--transition)",
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.transform = "translateY(-1px)";
+          e.currentTarget.style.boxShadow = "0 10px 26px rgba(83,77,231,0.48), 0 3px 8px rgba(83,77,231,0.30)";
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.transform = "translateY(0)";
+          e.currentTarget.style.boxShadow = "var(--accent-glow)";
         }}
       >
-        <img
-          src="https://img.icons8.com/?size=100&id=1501&format=png&color=ffffff"
-          alt="New Chat"
-          width="16"
-          height="16"
-        />
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
         New chat
       </button>
     </div>
 
-    {/* Divider */}
-    <div
-      style={{
-        height: 1,
-        background: "var(--border)",
-        margin: "0 12px",
-      }}
-    />
-
     {/* Workflows Label */}
-    <div style={{ padding: "14px 16px 6px" }}>
+    <div style={{ padding: "18px 18px 10px" }}>
       <div
         style={{
-          fontSize: 10,
+          fontSize: 10.5,
           fontWeight: 600,
-          letterSpacing: "0.9px",
+          letterSpacing: "1.4px",
           textTransform: "uppercase",
-          color: "var(--text-muted)",
+          color: "#ADB2CC",
         }}
       >
         Workflows
@@ -97,7 +95,7 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
       style={{
         flex: 1,
         overflowY: "auto",
-        padding: "2px 8px 16px",
+        padding: "2px 10px 16px",
       }}
     >
       {/* Loading State */}
@@ -136,10 +134,10 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
             style={{
               display: "flex",
               alignItems: "center",
-              gap: 9,
-              padding: "8px 10px",
+              gap: 12,
+              padding: "11px 12px",
               borderRadius: "var(--radius)",
-              fontSize: 12.5,
+              fontSize: 13.5,
               color:
                 activeWorkflow === wf
                   ? "var(--accent)"
@@ -150,7 +148,7 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
                   : "transparent",
               fontWeight: activeWorkflow === wf ? 500 : 400,
               cursor: "pointer",
-              marginBottom: 1,
+              marginBottom: 4,
               transition:
                 "background var(--transition), color var(--transition)",
               fontFamily: "var(--font)",
@@ -170,29 +168,24 @@ export default function Sidebar({ activeWorkflow, onWorkflowClick, onNewChat }) 
           >
             <div
               style={{
-                background:
-                  activeWorkflow === wf
-                    ? "var(--accent-light)"
-                    : "var(--surface-2)",
-                border: `1px solid ${
-                  activeWorkflow === wf
-                    ? "var(--accent-mid)"
-                    : "var(--border)"
-                }`,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 flexShrink: 0,
-                padding: "6px",
-                borderRadius: "6px",
+                opacity: activeWorkflow === wf ? 1 : 0.72,
               }}
             >
-              <img
-                src="https://img.icons8.com/?size=100&id=14115&format=png&color=545ead"
-                alt="Workflow"
-                width="16"
-                height="16"
-              />
+              <svg
+                width="16" height="16" viewBox="0 0 24 24"
+                fill="none"
+                stroke={activeWorkflow === wf ? "var(--accent)" : "#8A93C7"}
+                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+              >
+                <rect x="2.5" y="2.5" width="7" height="7" rx="1.5"/>
+                <rect x="14.5" y="14.5" width="7" height="7" rx="1.5"/>
+                <path d="M9.5 6h4a4 4 0 0 1 4 4v4.5"/>
+                <path d="M14.5 18h-4a4 4 0 0 1-4-4V9.5"/>
+              </svg>
             </div>
 
             <span>{wf}</span>

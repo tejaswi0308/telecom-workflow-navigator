@@ -179,26 +179,32 @@ export default function App() {
   return (
     <div style={{
       display: "flex",
-      flexDirection: "column",
       height: "100vh",
       overflow: "hidden",
     }}>
-      <Header />
+      <div style={{
+        display: "flex",
+        flexDirection: "column",
+        width: "var(--sidebar-w)",
+        flexShrink: 0,
+        borderRight: "1px solid var(--border)",
+        background: "var(--surface)",
+      }}>
+        <Header />
 
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         <Sidebar
           activeWorkflow={activeWorkflow}
           onWorkflowClick={handleWorkflowClick}
           onNewChat={handleNewChat}
         />
-
-        <ChatArea
-          messages={messages}
-          loading={loading}
-          onSend={sendMessage}
-          onFeedback={handleFeedback}
-        />
       </div>
+
+      <ChatArea
+        messages={messages}
+        loading={loading}
+        onSend={sendMessage}
+        onFeedback={handleFeedback}
+      />
     </div>
   );
 }
