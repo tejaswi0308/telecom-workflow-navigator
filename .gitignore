@@ -16,3 +16,5 @@ backend/app_data.db
 backend/memory/
 
 qna_eval_dataset.json
+
+backend/eval_results.csv
