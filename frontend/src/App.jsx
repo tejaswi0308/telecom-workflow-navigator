@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
-import Header from "./components/Header.jsx";
-import Sidebar from "./components/Sidebar.jsx";
-import ChatArea from "./components/ChatArea.jsx";
+import Header from "./components/chat interface/Header.jsx";
+import Sidebar from "./components/chat interface/Sidebar.jsx";
+import ChatArea from "./components/chat interface/ChatArea.jsx";
 
 // ---------------------------------------------------------------------------
 // sessionStorage keys — chat state persists across reloads within the SAME TAB only —
