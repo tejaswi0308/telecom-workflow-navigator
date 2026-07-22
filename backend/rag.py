@@ -1,10 +1,8 @@
 import argparse
-import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -13,7 +11,23 @@ load_dotenv()
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 
+from guardrails import (
+    CONTEXT_GOVERNANCE_PROMPT,
+    LOW_CONFIDENCE_REFUSAL,
+    NO_HISTORY_REFUSAL,
+    build_hint_matcher,
+    check_pre_retrieval_guardrails,
+    is_meta_conversation_question,
+)
+from memory import (
+    MEMORY_TURNS,
+    format_chat_history,
+    load_chat_memory,
+    memory_file_path,
+    save_chat_memory,
+)
 from utils import (
+    RERANK_THRESHOLD,
     SIMILARITY_THRESHOLD,
     apply_threshold,
     bm25_search,
@@ -35,9 +49,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration — all tuneable via environment variables
 # ---------------------------------------------------------------------------
-MEMORY_TURNS  = int(os.getenv("MEMORY_TURNS", "6"))
 DEFAULT_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 TEMPERATURE   = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+CANDIDATE_K   = int(os.getenv("RAG_CANDIDATE_K", "5"))    # dense/BM25/RRF pool size
+FINAL_K       = int(os.getenv("RAG_FINAL_K", "4"))        # chunks kept after cross-encoder rerank
 
 # ---------------------------------------------------------------------------
 # Hint tuples — conversational signal detection
@@ -46,6 +61,23 @@ FOLLOW_UP_HINTS = (
     "it", "this", "that", "they", "them", "there", "he", "she",
     "who approves", "what happens next", "what happens after",
     "and then", "next step", "after that",
+)
+
+# Relative-position follow-ups ("what is the step after X", "what comes
+# after X", "what follows X") reference the PREVIOUS turn's topic just as
+# much as a bare pronoun does, but none of them are literal substring
+# matches for anything in FOLLOW_UP_HINTS above — enumerating every
+# possible phrasing as an exact hint kept missing real variants (this
+# exact pattern was reported failing for "what is the step after RFI(B)?").
+# Using a wildcard regex instead of literal phrases, same fix as applied
+# elsewhere in this file for the same underlying problem.
+_RELATIVE_POSITION_RE = re.compile(
+    r"\bstep\s+(?:after|before)\b"
+    r"|\bcomes?\s+after\b"
+    r"|\bwhat\s+follows\b"
+    r"|\bfollow(?:s|ing)?\s+(?:after|that)\b"
+    r"|\bprevious\s+step\b",
+    re.IGNORECASE,
 )
 
 DEFINITION_HINTS = ("what is", "who is", "define", "what are")
@@ -127,60 +159,10 @@ def format_context(results: list[tuple]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Memory — file based, one file per session (will be replaced by DB in DB track)
+# Memory — see memory.py for all conversation-memory logic (load/save/format).
+# Imported above: load_chat_memory, save_chat_memory, format_chat_history,
+# memory_file_path, memory_dir_path, MEMORY_TURNS.
 # ---------------------------------------------------------------------------
-_SAFE_SESSION_ID_RE = re.compile(r"[^A-Za-z0-9_-]")
-
-
-def _sanitize_session_id(session_id: str) -> str:
-    """
-    Prevents path traversal / invalid filenames. Falls back to 'default'
-    if the sanitized id is empty.
-    """
-    cleaned = _SAFE_SESSION_ID_RE.sub("_", str(session_id or "").strip())
-    return cleaned or "default"
-
-
-def memory_dir_path() -> Path:
-    directory = Path(__file__).resolve().parent / "memory"
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def memory_file_path(session_id: str = "default") -> Path:
-    safe_id = _sanitize_session_id(session_id)
-    return memory_dir_path() / f"rag_memory_{safe_id}.json"
-
-
-def load_chat_memory(session_id: str = "default") -> list[dict[str, str]]:
-    path = memory_file_path(session_id)
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(data, list):
-        return []
-    turns: list[dict[str, str]] = []
-    for item in data[-MEMORY_TURNS:]:
-        if isinstance(item, dict) and "user" in item and "assistant" in item:
-            turns.append({"user": str(item["user"]), "assistant": str(item["assistant"])})
-    return turns
-
-
-def save_chat_memory(turns: list[dict[str, str]], session_id: str = "default") -> None:
-    path = memory_file_path(session_id)
-    path.write_text(json.dumps(turns[-MEMORY_TURNS:], indent=2), encoding="utf-8")
-
-
-def format_chat_history(turns: list[dict[str, str]]) -> str:
-    if not turns:
-        return "No previous conversation."
-    sections = []
-    for index, turn in enumerate(turns, start=1):
-        sections.append(f"Turn {index}\nUser: {turn['user']}\nAssistant: {turn['assistant']}")
-    return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -190,9 +172,21 @@ def is_explicit_topic_question(question: str) -> bool:
     return infer_workflow_type(question) is not None
 
 
+_FOLLOW_UP_MATCHER = build_hint_matcher(FOLLOW_UP_HINTS)
+
+
 def is_follow_up_question(question: str) -> bool:
-    lowered = question.lower()
-    return any(hint in lowered for hint in FOLLOW_UP_HINTS)
+    """
+    Uses word-boundary matching, not substring matching. The previous
+    version used `hint in lowered`, which meant short hints like "he"
+    matched inside completely unrelated words like "the" — so nearly every
+    English sentence (which almost always contains "the") was incorrectly
+    flagged as a follow-up question. This silently caused standalone
+    questions to go through unnecessary LLM-based rewriting whenever any
+    conversation history existed, which is a real contributor to both the
+    standalone-question regression and the follow-up regression reported.
+    """
+    return bool(_FOLLOW_UP_MATCHER.search(question)) or bool(_RELATIVE_POSITION_RE.search(question))
 
 
 def is_definition_question(question: str) -> bool:
@@ -201,6 +195,111 @@ def is_definition_question(question: str) -> bool:
 
 def is_process_question(question: str) -> bool:
     return any(hint in question.lower().strip() for hint in PROCESS_HINTS)
+
+
+# The previous version of this check only matched 4 exact literal phrases
+# ("list", "show me", "what are the steps", "sequence of steps") — so
+# "Explain the Upgrade workflow", "Describe the Upgrade workflow", "Walk me
+# through the Upgrade workflow", "Give me an overview of the Upgrade
+# workflow", and "How does the Upgrade workflow work?" all fell through to
+# normal RAG retrieval instead of the direct full-workflow parser, even
+# though they express the exact same intent. Using regex with wildcards
+# between key words (rather than literal substrings) so real phrasing that
+# inserts a workflow name in between ("explain the UPGRADE workflow") still
+# matches, instead of requiring an exact fixed phrase.
+_FULL_WORKFLOW_INTENT_RE = re.compile(
+    r"\blist\b"
+    r"|\bshow\s+me\b"
+    r"|\ball\s+(?:the\s+)?steps\b"
+    r"|\bsequence\s+of\s+steps\b"
+    r"|\bwhat\s+are\s+the\s+steps\b"
+    r"|\bsteps\s+(?:for|in|of)\b"
+    r"|\bcomplete\b.{0,40}\b(?:workflow|process)\b"
+    r"|\bentire\b.{0,40}\b(?:workflow|process)\b"
+    r"|\bstart\s+to\s+finish\b"
+    r"|\bwalk\s+(?:me\s+)?through\b"
+    r"|\boverview\s+of\b"
+    r"|\bdescribe\b.{0,40}\b(?:workflow|process)\b"
+    r"|\bexplain\b.{0,40}\b(?:workflow|process)\b"
+    r"|\bhow\s+(?:does|do)\b.{0,40}\bwork\b",
+    re.IGNORECASE,
+)
+
+
+def is_full_workflow_intent(question: str) -> bool:
+    """True if the question intends a complete workflow explanation/listing,
+    regardless of the specific wording used to ask for it."""
+    return bool(_FULL_WORKFLOW_INTENT_RE.search(question))
+
+
+# Comparative ("difference between X and Y") and aggregation ("which
+# workflows contain Z") questions inherently need MULTIPLE only-moderately-
+# relevant chunks assembled together — no single chunk can score high
+# against "compare A and B" the way it could against a narrow single-fact
+# question. These need different handling from the strict per-chunk
+# rerank threshold (see the threshold gate in rag_answer for how this is used).
+_BROAD_CONTEXT_RE = re.compile(
+    r"\bdifference\s+between\b"
+    r"|\bdiffers?\s+from\b|\bdiffering\s+from\b|\bdifferent\s+from\b|\bdiffers?\s+between\b"
+    r"|\bstructurally\s+(?:similar|identical|different)\b"
+    r"|\bcompare\b"
+    r"|\bcompared\s+to\b"
+    r"|\bversus\b|\bvs\.?\b"
+    r"|\bin\s+both\b.{0,60}\band\b"
+    r"|\bwhich\s+workflows?\s+(?:contains?|have|has|includes?|uses?)\b"
+    r"|\bwhich\s+workflows?\b.{0,40}\bdescribed\s+as\b"
+    r"|\bhow\s+many\s+workflows?\b"
+    r"|\ball\s+workflows?\b"
+    r"|\bsub-?variants?\b"
+    r"|\bsub-?workflows?\b"
+    r"|\bhow\s+many\b.{0,40}\b(?:are\s+there|does\b)\b",
+    re.IGNORECASE,
+)
+
+
+def count_distinct_workflows_mentioned(question: str) -> int:
+    """
+    Counts how many distinct workflows are named in the question, using the
+    same word-overlap approach as infer_workflow_type() but counting every
+    workflow with a match instead of picking just the single best one.
+
+    This exists because phrase-based detection ("difference between",
+    "compare") is fundamentally fragile to real-world typos and rewording —
+    a real reported case: "what is the difference BETTEN sr cancellation
+    and so cancellation" (typo for "between") matched no phrase pattern at
+    all, so the question was wrongly treated as narrow and refused, even
+    though the exact same intent asked as a follow-up worked fine. Counting
+    workflow NAME mentions is far more robust: it doesn't matter what word
+    connects "SR Cancellation" and "SO Cancellation", or whether that
+    connecting word is misspelled — both names being present is itself a
+    strong, typo-proof signal that this is a comparative question.
+    """
+    query_words = set(normalize_text(question).split())
+    workflow_map = scan_available_workflows()
+    mentioned = 0
+    for slug in workflow_map.keys():
+        slug_words = set(slug.split("_"))
+        # Subset, not overlap: "cancellation" alone overlaps with So/Sr/Tenancy
+        # Cancellation all at once, which isn't actually distinguishing —
+        # require every word of the slug to be present, not just one shared word.
+        if slug_words.issubset(query_words):
+            mentioned += 1
+    return mentioned
+
+
+def is_broad_context_question(question: str) -> bool:
+    """
+    True for questions that structurally need multiple, only-moderately-
+    relevant chunks combined (full-workflow explanations, comparisons,
+    aggregation across documents) — as opposed to narrow factual questions
+    where a single chunk really should score highly if it's the right one.
+    """
+    return (
+        is_full_workflow_intent(question)
+        or is_complex_query(question)
+        or bool(_BROAD_CONTEXT_RE.search(question))
+        or count_distinct_workflows_mentioned(question) >= 2
+    )
 
 
 def is_complex_query(question: str) -> bool:
@@ -309,6 +408,45 @@ def select_best_section(question: str, markdown: str) -> str:
     return best_content or markdown
 
 
+_SUBWORKFLOW_SECTION_RE = re.compile(
+    r"^##\s*Sub-workflow\s+(\d+):\s*(.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_subworkflow_sections(markdown: str) -> list[str]:
+    """
+    Extracts 'Sub-workflow N: Title' sections — used by documents (e.g.
+    Disconnect/Reconnect) structured as several parallel independent
+    sub-processes rather than one linear numbered step sequence, which
+    extract_numbered_steps() cannot parse at all (it only recognizes bare
+    "1. Step text" lines). Each sub-workflow is formatted as one summary
+    line combining its title, responsible actor, and progression track.
+    """
+    matches = list(_SUBWORKFLOW_SECTION_RE.finditer(markdown))
+    if not matches:
+        return []
+
+    sections = []
+    for i, match in enumerate(matches):
+        title = match.group(2).strip()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        body = markdown[start:end]
+
+        actor_match = re.search(r"-\s*Actor:\s*(.+)", body)
+        progression_match = re.search(r"-\s*Progression Track:\s*(.+)", body)
+
+        line = title
+        if actor_match:
+            line += f" (handled by {actor_match.group(1).strip()})"
+        if progression_match:
+            line += f" — {progression_match.group(1).strip()}"
+        sections.append(line)
+
+    return sections
+
+
 def extract_numbered_steps(section_text: str) -> list[str]:
     steps = []
     for raw_line in section_text.splitlines():
@@ -404,10 +542,22 @@ def build_process_direct_answer(question: str, results: list[tuple]) -> tuple[st
 
     section = select_best_section(question, markdown)
     steps = extract_numbered_steps(section) or extract_numbered_steps(markdown)
+    used_subworkflow_format = False
+    if not steps:
+        # Fall back to sub-workflow-style documents (parallel independent
+        # processes rather than one linear numbered sequence) — see
+        # extract_subworkflow_sections() for why this is a separate format.
+        steps = extract_subworkflow_sections(markdown)
+        used_subworkflow_format = bool(steps)
     if not steps:
         return None
 
-    lines = [f"Based on the provided context, the {workflow} workflow has {len(steps)} steps:", ""]
+    if used_subworkflow_format:
+        lines = [
+            f"The {workflow} workflow consists of {len(steps)} independent sub-workflows:", ""
+        ]
+    else:
+        lines = [f"Based on the provided context, the {workflow} workflow has {len(steps)} steps:", ""]
     for i, step in enumerate(steps, start=1):
         lines.append(f"{i}. {step}")
     return "\n".join(lines), workflow
@@ -416,25 +566,64 @@ def build_process_direct_answer(question: str, results: list[tuple]) -> tuple[st
 # ---------------------------------------------------------------------------
 # Question rewriting for follow-ups
 # ---------------------------------------------------------------------------
+_PRONOUN_REFERENCE_HINTS = ("it", "this", "that", "they", "them", "there", "he", "she")
+_PRONOUN_MATCHER = build_hint_matcher(_PRONOUN_REFERENCE_HINTS)
+
+
+def has_unresolved_pronoun_reference(question: str) -> bool:
+    """
+    True if the question contains a bare pronoun/reference word that needs
+    conversation history to resolve — distinct from is_explicit_topic_question,
+    which only checks whether a workflow NAME is present. A question can do
+    both at once: "How is THAT different from SR Cancellation?" names SR
+    Cancellation explicitly, but "that" still needs resolving to whatever was
+    discussed previously. Rewriting must not be skipped in that case.
+    """
+    return bool(_PRONOUN_MATCHER.search(question))
+
+
 def rewrite_question(
     question: str,
     history: list[dict[str, str]],
     verbose: bool = False,
     langfuse_handler=None,
 ) -> str:
-    if (
-        not history
-        or not is_follow_up_question(question)
-        or is_explicit_topic_question(question)
-        or is_definition_question(question)
-    ):
+    if not history or is_definition_question(question):
+        return question
+
+    workflow_identifiable = is_explicit_topic_question(question)  # == infer_workflow_type(question) is not None
+    looks_like_follow_up = is_follow_up_question(question)
+
+    # Previously this only attempted rewriting when is_follow_up_question
+    # matched a pronoun/phrase hint ("it", "that", "who approves", etc.).
+    # That misses a real, distinct case: a question naming a specific but
+    # workflow-AMBIGUOUS term ("what is the step after RFI(B)?" — RFI(B)
+    # appears in both Share and Upgrade) has no pronoun and no follow-up
+    # phrase, so it never looked like a follow-up — yet it still can't be
+    # resolved to a single workflow without history. If the question can't
+    # identify its own workflow AND history exists, that combination alone
+    # is reason enough to attempt a history-informed rewrite, regardless of
+    # whether it also happens to contain a pronoun.
+    if not looks_like_follow_up and workflow_identifiable:
+        return question  # fully self-contained — nothing for history to add
+
+    # Previously this also skipped rewriting whenever is_explicit_topic_question
+    # was true — but that's wrong when the question BOTH names a topic AND
+    # contains an unresolved pronoun ("how is THAT different from SR
+    # Cancellation?"). Only skip if there's truly nothing left to resolve.
+    if workflow_identifiable and not has_unresolved_pronoun_reference(question):
         return question
 
     llm = build_llm()
     prompt = (
         "Rewrite the user's follow-up into a standalone question using the conversation "
-        "history. Keep workflow names and entities explicit. Return only the rewritten "
-        "question, with no extra text.\n\n"
+        "history. Keep workflow names and entities explicit. "
+        "IMPORTANT: when resolving a pronoun or reference (\"it\", \"that\", \"this\"), "
+        "always resolve it to the MOST RECENT topic discussed in the conversation history "
+        "below — not an earlier one, even if an earlier topic seems more prominent. "
+        "The conversation may have moved from one workflow to another; always assume the "
+        "reference points to whatever was discussed LAST, immediately before this question. "
+        "Return only the rewritten question, with no extra text.\n\n"
         f"Conversation History:\n{format_chat_history(history)}\n\n"
         f"Follow-up Question: {question}\n\n"
         "Standalone Question:"
@@ -445,6 +634,34 @@ def rewrite_question(
     if verbose and rewritten and rewritten != question:
         print(f"Rewritten question: {rewritten}")
     return rewritten or question
+
+
+def answer_from_conversation_memory(
+    question: str,
+    history: list[dict[str, str]],
+    langfuse_handler=None,
+) -> str:
+    """
+    Answers questions ABOUT the conversation itself (e.g. "summarize this
+    conversation", "which workflow were we discussing") using ONLY the
+    conversation history — never touches the document index, embeddings,
+    retrieval, or reranking. This is a deliberately separate code path from
+    the main RAG generation prompt, since the source of truth for these
+    questions is what was actually said, not the workflow documents.
+    """
+    llm = build_llm()
+    prompt = (
+        "You are answering a question about the CONVERSATION ITSELF, not about "
+        "telecom workflows or documents. Use ONLY the conversation history below "
+        "to answer — do not invent, assume, or add anything that isn't actually "
+        "present in the history. If the history doesn't contain enough to answer "
+        "confidently, say so plainly.\n\n"
+        f"Conversation History:\n{format_chat_history(history)}\n\n"
+        f"Question: {question}\n\n"
+        "Answer:"
+    )
+    response = llm.invoke(prompt, config={"callbacks": []})
+    return response.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +696,127 @@ def _build_langfuse() -> tuple:
         host=os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
     )
     return client, None
+
+
+def build_display_sources(
+    scored_chunks: list[tuple],
+    threshold: float,
+    require_threshold: bool = True,
+    min_floor: float = 0.05,
+) -> list[dict]:
+    """
+    Builds the source list actually shown to the user in the UI: exactly
+    ONE entry per workflow, at that workflow's single highest-scoring chunk.
+
+    require_threshold=True (default — used for narrow factual questions):
+    only workflows whose best chunk actually clears `threshold` are shown.
+    A low score there genuinely signals the wrong/irrelevant chunk, so
+    hiding it is the right call.
+
+    require_threshold=False (used for broad/comparative/full-workflow
+    questions): shows the best-scoring chunk per workflow even if it
+    doesn't clear the strict `threshold` — for these question types, a
+    moderate per-chunk score reflects question BREADTH (no single fragment
+    can score high against "explain the whole workflow" or "compare X and
+    Y"), not irrelevance. BUT this still requires clearing `min_floor` — a
+    real reported bug showed workflows with a literal 0.000 score being
+    displayed as if they were "evidence" for the answer, which is noise,
+    not honesty. require_threshold=False relaxes the bar, it does not
+    remove it entirely.
+
+    This is still deliberately separate from what gets sent to the LLM as
+    context (see is_broad_context_question in rag_answer) — this function
+    only controls what's DISPLAYED as evidence, never what the LLM used to
+    write the answer.
+    """
+    best_by_workflow: dict[str, float] = {}
+    for doc, score in scored_chunks:
+        workflow = doc.metadata.get("workflow", "Unknown")
+        score = float(score)
+        if require_threshold and score < threshold:
+            continue
+        if not require_threshold and score < min_floor:
+            continue
+        if workflow not in best_by_workflow or score > best_by_workflow[workflow]:
+            best_by_workflow[workflow] = score
+
+    return [
+        {"workflow": workflow, "score": score}
+        for workflow, score in sorted(best_by_workflow.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+
+_WHICH_WORKFLOWS_CONTAIN_RE = re.compile(
+    r"\bwhich\s+workflows?\s+(?:contains?|have|has|includes?|uses?|mentions?)\s+(.+?)\??\s*$",
+    re.IGNORECASE,
+)
+
+
+def try_answer_workflow_aggregation_question(question: str) -> tuple[str, list[str]] | None:
+    """
+    'Which workflow(s) contain/have/include X' is fundamentally an
+    exhaustive-match question — the correct answer requires checking EVERY
+    workflow document, not finding the top-k most semantically similar
+    chunks. A similarity-search pipeline structurally cannot guarantee this
+    (it might easily surface chunks from only 2 of 4 workflows that
+    actually contain the term, depending on incidental phrasing similarity).
+    So for this specific question shape, we bypass retrieval entirely and
+    do a direct, deterministic case-insensitive scan across every workflow
+    source file — the same way a person would grep for the term.
+
+    Returns (answer_text, matching_workflow_names) or None if the question
+    doesn't match this pattern, or the term isn't found anywhere.
+    """
+    match = _WHICH_WORKFLOWS_CONTAIN_RE.search(question)
+    if not match:
+        return None
+    term = match.group(1).strip().strip("?").strip()
+    if not term or len(term) > 60:  # implausibly long "term" means the regex over-matched
+        return None
+
+    workflow_map = scan_available_workflows()
+    term_lower = term.lower()
+    matching_workflows: list[str] = []
+
+    for slug, paths in workflow_map.items():
+        for path in paths:
+            try:
+                content = path.read_text(encoding="utf-8").lower()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if term_lower in content:
+                matching_workflows.append(slug.replace("_", " ").title())
+                break
+
+    if not matching_workflows:
+        return None
+
+    matching_workflows = sorted(set(matching_workflows))
+    if len(matching_workflows) == 1:
+        answer = f'Only the {matching_workflows[0]} workflow contains "{term}".'
+    elif len(matching_workflows) == 2:
+        answer = f'The following workflows contain "{term}": {matching_workflows[0]} and {matching_workflows[1]}.'
+    else:
+        listed = ", ".join(matching_workflows[:-1]) + f", and {matching_workflows[-1]}"
+        answer = f'The following workflows contain "{term}": {listed}.'
+    return answer, matching_workflows
+
+
+def get_all_documents(vectorstore) -> list:
+    """
+    Returns every document chunk stored in the vectorstore — used to give
+    BM25 an INDEPENDENT search pool, separate from whatever dense retrieval
+    happened to narrow its own candidates down to. Previously BM25 searched
+    only within dense's own deduplicated results, meaning BM25 could never
+    recover a chunk dense missed — which defeats the entire point of hybrid
+    retrieval (each method is supposed to catch what the other might not).
+    """
+    try:
+        return list(vectorstore.docstore._dict.values())
+    except AttributeError:
+        # Degrade gracefully rather than crash if a different vectorstore
+        # implementation doesn't expose docstore._dict the same way.
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -559,19 +897,102 @@ def rag_answer(
     try:
         vectorstore = load_vectorstore(index_path)
     except FileNotFoundError as exc:
-        return {"answer": str(exc), "sources": [], "error": "index_not_found"}
+        return {"answer": str(exc), "sources": [], "error": "index_not_found", "contexts": []}
 
     # ── 2. Load memory ────────────────────────────────────────────────────
     history = load_chat_memory(session_id)
+    early_inferred_wf = infer_workflow_type(question)
+    early_is_explicit = is_explicit_topic_question(question)
     trace_metadata.update(
         {
             "history_turns": len(history),
             "is_follow_up_question": is_follow_up_question(question),
-            "is_explicit_topic_question": is_explicit_topic_question(question),
+            "is_explicit_topic_question": early_is_explicit,
         }
     )
 
-    # ── 3. Rewrite follow-up ──────────────────────────────────────────────
+    # ── 3. Pre-retrieval guardrails (internal-leakage + no-history) ───────
+    # Runs BEFORE the rewrite LLM call and BEFORE any retrieval, on the raw
+    # question. This is deliberate: these are hard, deterministic refusals
+    # that must not depend on the LLM choosing to refuse — they block the
+    # question from ever reaching a place where an answer could be
+    # fabricated. See guardrails.py for the full rationale.
+    guardrail_refusal = check_pre_retrieval_guardrails(
+        question=question,
+        history=history,
+        is_explicit_topic_question=early_is_explicit,
+        inferred_workflow=early_inferred_wf,
+    )
+    if guardrail_refusal is not None:
+        finalize_trace(
+            guardrail_refusal, [],
+            extra_metadata={
+                "answer_mode": "guardrail_refusal",
+                "guardrail_triggered": True,
+            },
+        )
+        return {"answer": guardrail_refusal, "sources": [], "error": None, "contexts": []}
+
+    # ── Meta-conversation routing ──────────────────────────────────────────
+    # Questions ABOUT the conversation itself ("what did we discuss",
+    # "summarize this conversation") are answered from session memory
+    # DIRECTLY — they never reach document retrieval at all. The answer to
+    # "which workflow were we talking about" lives in what was actually said
+    # in this session, not in the workflow docs, so searching the docs for
+    # it is both pointless and risks pulling in an unrelated "best available"
+    # chunk. If there's no history, this falls back to the same no-history
+    # refusal used elsewhere (check_pre_retrieval_guardrails already covers
+    # most such cases, but this is a second, explicit guard specific to this
+    # routing branch since meta-conversation intent is a distinct decision).
+    if is_meta_conversation_question(question):
+        if not history:
+            finalize_trace(
+                NO_HISTORY_REFUSAL, [],
+                extra_metadata={"answer_mode": "meta_conversation_no_history"},
+            )
+            return {"answer": NO_HISTORY_REFUSAL, "sources": [], "error": None, "contexts": []}
+
+        memory_answer = answer_from_conversation_memory(
+            question, history, langfuse_handler=langfuse_handler,
+        )
+        save_chat_memory(history + [{"user": question, "assistant": memory_answer}], session_id)
+        log_span(
+            "meta_conversation_answer",
+            input_data={"question": question},
+            output_data={"answer": memory_answer},
+            metadata={"history_turns": len(history), "bypassed_retrieval": True},
+        )
+        finalize_trace(
+            memory_answer, [],
+            extra_metadata={"answer_mode": "meta_conversation_from_memory"},
+        )
+        return {"answer": memory_answer, "sources": [], "error": None, "contexts": []}
+
+    # ── Aggregation-question routing ────────────────────────────────────────
+    # "Which workflows contain X" needs an exhaustive scan across every
+    # workflow document, not a top-k similarity search — see
+    # try_answer_workflow_aggregation_question() for why. This runs on the
+    # raw question (not standalone_question) since it doesn't depend on
+    # conversation history at all.
+    aggregation_answer = try_answer_workflow_aggregation_question(question)
+    if aggregation_answer is not None:
+        answer_text, matched_workflows = aggregation_answer
+        history.append({"user": question, "assistant": answer_text})
+        save_chat_memory(history, session_id)
+        sources = [{"workflow": wf, "score": 1.0} for wf in matched_workflows]
+        log_span(
+            "workflow_aggregation_scan",
+            input_data={"question": question},
+            output_data={"matched_workflows": matched_workflows},
+            metadata={"bypassed_retrieval": True},
+        )
+        finalize_trace(
+            answer_text, sources,
+            extra_metadata={"answer_mode": "workflow_aggregation_scan"},
+        )
+        return {"answer": answer_text, "sources": sources, "error": None, "contexts": []}
+
+    # ── 4. Rewrite follow-up ──────────────────────────────────────────────
     standalone_question = rewrite_question(
         question, history, verbose=verbose, langfuse_handler=langfuse_handler,
     )
@@ -594,23 +1015,28 @@ def rag_answer(
             },
         )
 
-    if (
-        is_follow_up_question(standalone_question)
-        and not is_explicit_topic_question(standalone_question)
-        and not history
-    ):
-        answer = (
-            "I'm sorry, but your question refers to a previous topic and there is no "
-            "active chat history. Could you please specify which workflow you are asking about?"
-        )
-        finalize_trace(answer, [], extra_metadata={"answer_mode": "follow_up_without_history"})
-        return {"answer": answer, "sources": [], "error": None}
+    # ── 5. Workflow routing ───────────────────────────────────────────────
+    inferred_wf = early_inferred_wf or infer_workflow_type(standalone_question)
+    inferred_from_history = False
+    if not inferred_wf and history:
+        # The current question alone doesn't name a workflow — before
+        # giving up, check what workflow the most recent turn was actually
+        # about. This matters even when rewrite_question() didn't trigger
+        # (e.g. relative-position phrasing not caught by is_follow_up_question
+        # — a real reported case: "what is the step after RFI(B)?" after
+        # discussing a specific workflow). Without this, such a question
+        # searches the WHOLE corpus with no workflow scope at all, even
+        # though a person would obviously read it as "in the workflow we
+        # were just discussing".
+        last_turn = history[-1]
+        last_turn_text = f"{last_turn.get('user', '')} {last_turn.get('assistant', '')}"
+        inferred_wf = infer_workflow_type(last_turn_text)
+        inferred_from_history = bool(inferred_wf)
 
-    # ── 4. Workflow routing ───────────────────────────────────────────────
-    inferred_wf = infer_workflow_type(question) or infer_workflow_type(standalone_question)
     trace_metadata.update(
         {
             "inferred_workflow": inferred_wf,
+            "inferred_workflow_from_history_fallback": inferred_from_history,
             "standalone_question_is_follow_up": is_follow_up_question(standalone_question),
             "standalone_question_is_explicit_topic": is_explicit_topic_question(standalone_question),
         }
@@ -618,13 +1044,17 @@ def rag_answer(
     if verbose and inferred_wf:
         print(f"Router → target slug: {inferred_wf}")
 
-    # ── 5. Dense retrieval (FAISS cosine) + threshold ────────────────────
+    # ── 6. Dense retrieval (FAISS cosine) + threshold ────────────────────
     t_dense_start = datetime.now(timezone.utc)
-    candidate_k = max(top_k * 5, top_k + 10)
+    candidate_k = CANDIDATE_K
     trace_metadata["candidate_k"] = candidate_k
     dense_candidates: list[tuple] = []
 
     for retrieval_query in build_retrieval_queries(standalone_question):
+        # With the index built as MAX_INNER_PRODUCT over normalized embeddings
+        # (see ingest.py), this raw score IS exact cosine similarity — for
+        # unit vectors, inner product and cosine similarity are the same
+        # value by definition. No derived/transformed score needed here.
         dense_candidates.extend(
             vectorstore.similarity_search_with_score(retrieval_query, k=candidate_k)
         )
@@ -657,33 +1087,48 @@ def rag_answer(
     trace_metadata["dense_result_count"] = len(dense_results)
     t_dense_end = datetime.now(timezone.utc)
 
-    # ── 6. BM25 retrieval (independent) ──────────────────────────────────
+    # ── 7. BM25 retrieval (independent) ──────────────────────────────────
     t_bm25_start = datetime.now(timezone.utc)
-    all_docs_only = [doc for doc, _ in dense_deduped]
-    bm25_results = bm25_search(standalone_question, all_docs_only, top_k=candidate_k)
+    # BM25 now searches the FULL corpus independently of dense retrieval's
+    # own results — get_all_documents() pulls every chunk from the
+    # vectorstore directly. Optionally scoped to the inferred workflow
+    # (same precision dense applies) when one is confidently known, but
+    # computed independently rather than derived from dense's narrowed
+    # candidate list, so BM25 can actually recover chunks dense missed.
+    all_corpus_docs = get_all_documents(vectorstore)
+    if inferred_wf:
+        workflow_scoped_docs = [
+            doc for doc in all_corpus_docs
+            if doc.metadata.get("workflow_slug", "") == inferred_wf
+        ]
+        bm25_corpus = workflow_scoped_docs if workflow_scoped_docs else all_corpus_docs
+    else:
+        bm25_corpus = all_corpus_docs
+    bm25_results = bm25_search(standalone_question, bm25_corpus, top_k=candidate_k)
     trace_metadata["bm25_result_count"] = len(bm25_results)
+    trace_metadata["bm25_corpus_size"] = len(bm25_corpus)
     t_bm25_end = datetime.now(timezone.utc)
 
-    # ── 7. RRF merge (dense + BM25) ───────────────────────────────────────
+    # ── 8. RRF merge (dense + BM25) ───────────────────────────────────────
     t_rrf_start = datetime.now(timezone.utc)
     merged_results = merge_rrf(
         [dense_results, bm25_results],
-        top_k=10,
+        top_k=candidate_k,
     )
     trace_metadata["merged_result_count"] = len(merged_results)
     t_rrf_end = datetime.now(timezone.utc)
 
     if not merged_results:
-        answer = "No relevant context found."
-        finalize_trace(answer, [], extra_metadata={"answer_mode": "no_context"})
-        return {"answer": answer, "sources": [], "error": None}
+        finalize_trace(
+            LOW_CONFIDENCE_REFUSAL, [],
+            extra_metadata={"answer_mode": "no_context", "refusal_reason": "no_merged_results"},
+        )
+        return {"answer": LOW_CONFIDENCE_REFUSAL, "sources": [], "error": None, "contexts": []}
 
-    # ── 8. CrossEncoder reranking ─────────────────────────────────────────
+    # ── 9. CrossEncoder reranking ─────────────────────────────────────────
     t_rerank_start = datetime.now(timezone.utc)
-    reranked_results = rerank_results(standalone_question, merged_results, top_k=top_k)
-
-    results = reranked_results
-    trace_metadata["reranked_result_count"] = len(results)
+    reranked_results = rerank_results(standalone_question, merged_results, top_k=FINAL_K)
+    trace_metadata["reranked_result_count"] = len(reranked_results)
     t_rerank_end = datetime.now(timezone.utc)
 
     # ── Log all retrieval spans WITH exact performance timestamps ─────────
@@ -704,7 +1149,7 @@ def rag_answer(
                     "cosine_score": round(float(score), 4),
                     "preview": doc.page_content[:200],
                 }
-                for i, (doc, score) in enumerate(dense_results[:top_k])
+                for i, (doc, score) in enumerate(dense_results[:candidate_k])
             ],
         },
         start_time=t_dense_start,
@@ -714,7 +1159,7 @@ def rag_answer(
 
     log_span(
         "bm25_retrieval",
-        input_data={"query": standalone_question, "total_docs": len(all_docs_only)},
+        input_data={"query": standalone_question, "total_docs": len(bm25_corpus)},
         output_data={
             "total_results": len(bm25_results),
             "chunks": [
@@ -724,7 +1169,7 @@ def rag_answer(
                     "bm25_score": round(float(score), 4),
                     "preview": doc.page_content[:200],
                 }
-                for i, (doc, score) in enumerate(bm25_results[:top_k])
+                for i, (doc, score) in enumerate(bm25_results[:candidate_k])
             ],
         },
         start_time=t_dense_end,
@@ -746,7 +1191,7 @@ def rag_answer(
                     "workflow": doc.metadata.get("workflow", "Unknown"),
                     "rrf_score": round(float(score), 6),
                 }
-                for i, (doc, score) in enumerate(merged_results[:top_k])
+                for i, (doc, score) in enumerate(merged_results[:candidate_k])
             ],
         },
         start_time=t_bm25_end,
@@ -758,7 +1203,7 @@ def rag_answer(
         input_data={
             "question": standalone_question,
             "chunks_in": len(merged_results),
-            "top_k": 3,
+            "top_k": FINAL_K,
         },
         output_data={
             "final_top_k_chunks": [
@@ -775,29 +1220,51 @@ def rag_answer(
         end_time=t_rerank_end,
     )
 
-    # ── 10. Direct answer parser (simple list questions) ──────────────────
+    # ── 10. Direct answer parser (attempted FIRST, before threshold gating) ─
+    # This runs on reranked_results directly (pre-threshold) rather than
+    # waiting for a confidence gate, because it works fundamentally
+    # differently from the LLM generation path: once it identifies the
+    # right workflow from even a single moderately-ranked chunk, it reads
+    # the ENTIRE source markdown file directly and extracts the full step
+    # list from there — it doesn't depend on any one chunk scoring high
+    # against a broad "explain the whole workflow" question, which cross-
+    # encoders structurally can't do well (no single fragment IS the whole
+    # workflow, so no fragment scores high against that framing, even when
+    # retrieval found exactly the right document).
     use_direct_parser = (
         is_process_question(standalone_question)
-        and any(
-            kw in standalone_question.lower()
-            for kw in ("list", "show me", "what are the steps", "sequence of steps")
-        )
+        and is_full_workflow_intent(standalone_question)
         and not is_complex_query(standalone_question)
     )
     trace_metadata["use_direct_parser"] = use_direct_parser
 
     if use_direct_parser:
-        direct_answer = build_process_direct_answer(standalone_question, results)
+        direct_answer = build_process_direct_answer(standalone_question, reranked_results)
         if direct_answer:
             answer_text, matched_workflow = direct_answer
             history.append({"user": question, "assistant": answer_text})
             save_chat_memory(history, session_id)
 
-            sources = [
-                {"workflow": doc.metadata.get("workflow", "Unknown"), "score": float(score)}
-                for doc, score in results
+            matching_chunks = [
+                (doc, score) for doc, score in reranked_results
                 if doc.metadata.get("workflow") == matched_workflow
             ]
+            # Unlike the LLM-generation path, the direct parser's correctness
+            # does NOT depend on any individual chunk's rerank score — it
+            # reads the whole source file directly once it identifies the
+            # right workflow. A fragment naturally scores low against a
+            # broad "explain everything" framing even when it's from
+            # exactly the right document (see is_broad_context_question
+            # above), so gating the source display on that score was
+            # hiding evidence for answers that were already known correct.
+            # Always show the matched workflow here, using its best
+            # available score honestly — even if that score is low, it's
+            # still telling the truth about which document the (correct)
+            # answer came from.
+            if matching_chunks:
+                sources = build_display_sources(matching_chunks, RERANK_THRESHOLD, require_threshold=False)
+            else:
+                sources = []
             finalize_trace(
                 answer_text,
                 sources,
@@ -806,16 +1273,75 @@ def rag_answer(
                     "matched_workflow": matched_workflow,
                 },
             )
-            return {"answer": answer_text, "sources": sources, "error": None}
+            return {
+                "answer": answer_text,
+                "sources": sources,
+                "error": None,
+                "contexts": [doc.page_content for doc, _ in reranked_results],
+            }
 
-    # ── 11. LLM generation ────────────────────────────────────────────────
+    # ── 11. Post-rerank relevance threshold gate ────────────────────────────
+    # This is the core hallucination-prevention mechanism for NARROW factual
+    # questions, where a single chunk really should score high if it's the
+    # right one — low score there genuinely signals irrelevant context.
+    #
+    # It is RELAXED for broad/comparative/aggregation questions (full-workflow
+    # explanations that skipped or failed the direct parser above, "compare X
+    # and Y", "which workflows contain Z") — these inherently need multiple
+    # only-moderately-relevant chunks assembled together, and gating on any
+    # one chunk's isolated score would refuse questions that are genuinely
+    # answerable from the combined context. For these, we still pass
+    # everything through the CONTEXT_GOVERNANCE_PROMPT, which explicitly
+    # instructs the LLM to refuse honestly if the assembled context still
+    # isn't sufficient — so this isn't an unguarded bypass, it's shifting
+    # the "is this enough" judgment from a per-chunk number to the LLM's own
+    # holistic read of all the assembled context together.
+    broad_question = is_broad_context_question(standalone_question)
+    trace_metadata["broad_context_question"] = broad_question
+
+    qualified_results = [
+        (doc, score) for doc, score in reranked_results if score >= RERANK_THRESHOLD
+    ]
+    top_rerank_score = round(float(reranked_results[0][1]), 4) if reranked_results else None
+    trace_metadata.update(
+        {
+            "rerank_threshold": RERANK_THRESHOLD,
+            "qualified_result_count": len(qualified_results),
+            "top_rerank_score": top_rerank_score,
+        }
+    )
+
+    if not qualified_results and not broad_question:
+        finalize_trace(
+            LOW_CONFIDENCE_REFUSAL, [],
+            extra_metadata={
+                "answer_mode": "low_confidence_refusal",
+                "top_rerank_score": top_rerank_score,
+            },
+        )
+        return {"answer": LOW_CONFIDENCE_REFUSAL, "sources": [], "error": None, "contexts": []}
+
+    if broad_question and not qualified_results:
+        # Nothing cleared the strict bar, but this is a broad question where
+        # that's expected — fall back to the raw reranked set (still
+        # genuinely the best-available evidence, just not all individually
+        # "highly confident") and let the LLM judge sufficiency itself.
+        results = reranked_results
+    else:
+        results = qualified_results
+
+    # ── 12. LLM generation ────────────────────────────────────────────────
     context = format_context(results)
     llm = build_llm()
 
     prompt = (
+        f"{CONTEXT_GOVERNANCE_PROMPT}\n\n"
         "You are a telecom workflow assistant. Use the conversation history for follow-up "
         "questions, but answer using only the provided context. "
-        "If the answer is not in the context, say you could not find it. "
+        f'If the context does not fully answer the question, respond with EXACTLY this '
+        f'phrase and nothing else: "{LOW_CONFIDENCE_REFUSAL}" — do not improvise your own '
+        "wording for a refusal, and do not partially answer with a caveat; either answer "
+        "properly from the context or use the exact refusal phrase above. "
         "Be concise and accurate. Reference workflow names when useful. "
         "Do NOT include citation numbers like [1] or [2] in your answer.\n"
         f"Answering guidance: {build_answering_hint(standalone_question)}\n\n"
@@ -896,14 +1422,19 @@ def rag_answer(
     history.append({"user": question, "assistant": answer_clean})
     save_chat_memory(history, session_id)
 
-    sources = []
-    seen: set[str] = set()
-    for document, score in results:
-        workflow = document.metadata.get("workflow", "Unknown")
-        if workflow in seen:
-            continue
-        seen.add(workflow)
-        sources.append({"workflow": workflow, "score": float(score)})
+    # If the LLM judged the context insufficient and used the refusal phrase,
+    # sources must be empty too — a refusal should never be shown alongside
+    # "N sources used", even if those sources technically cleared the
+    # earlier rerank threshold. Confidence and displayed evidence must agree.
+    if answer_clean.strip() == LOW_CONFIDENCE_REFUSAL:
+        sources = []
+    else:
+        # Narrow questions: strict (a low score genuinely means wrong chunk).
+        # Broad questions: show the best available evidence per workflow
+        # even if it doesn't clear the strict bar — hiding sources entirely
+        # for a correct, well-grounded broad answer looked unsupported and
+        # was flagged as confusing on the frontend.
+        sources = build_display_sources(results, RERANK_THRESHOLD, require_threshold=not broad_question)
 
     # Finalise trace
     finalize_trace(
@@ -916,7 +1447,12 @@ def rag_answer(
         },
     )
 
-    return {"answer": answer_clean, "sources": sources, "error": None}
+    return {
+        "answer": answer_clean,
+        "sources": sources,
+        "error": None,
+        "contexts": [doc.page_content for doc, _ in results],
+    }
 
 
 # ---------------------------------------------------------------------------

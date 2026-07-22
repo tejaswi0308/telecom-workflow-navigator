@@ -6,6 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.utils import DistanceStrategy
 
 load_dotenv()
 
@@ -18,18 +19,35 @@ EMBEDDING_MODEL      = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 EMBEDDING_DEVICE     = os.getenv("EMBEDDING_DEVICE", "cpu")
 RERANKER_MODEL       = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-large")
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.7"))
+RERANK_THRESHOLD     = float(os.getenv("RERANK_THRESHOLD", "0.7"))
 RRF_K                = int(os.getenv("RRF_K", "60"))
 
 
 # ---------------------------------------------------------------------------
 # Embeddings
 # ---------------------------------------------------------------------------
+_embeddings_cache: HuggingFaceEmbeddings | None = None  # loaded once, reused across all requests
+
+
 def build_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": EMBEDDING_DEVICE},
-        encode_kwargs={"normalize_embeddings": True},  # required for cosine similarity
-    )
+    """
+    Lazily loads and caches the embedding model. Previously this
+    constructed a brand new HuggingFaceEmbeddings (and therefore a brand
+    new SentenceTransformer, reloading BAAI/bge-large-en-v1.5 from disk)
+    on every single call — and this function was called fresh on every
+    request via load_vectorstore(). Caching it here mirrors the existing
+    fix already applied to the CrossEncoder reranker (_get_reranker below).
+    """
+    global _embeddings_cache
+    if _embeddings_cache is None:
+        logger.info("Loading embedding model '%s' (one-time load)...", EMBEDDING_MODEL)
+        _embeddings_cache = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": EMBEDDING_DEVICE},
+            encode_kwargs={"normalize_embeddings": True},  # required for cosine similarity
+        )
+        logger.info("Embedding model loaded and cached.")
+    return _embeddings_cache
 
 
 # ---------------------------------------------------------------------------
@@ -65,16 +83,35 @@ def get_index_path() -> Path:
 # ---------------------------------------------------------------------------
 # Vector store — cosine similarity via normalized embeddings + inner product
 # ---------------------------------------------------------------------------
+_vectorstore_cache: FAISS | None = None  # loaded once, reused across all requests
+
+
 def load_vectorstore(index_path: Path) -> FAISS:
+    """
+    Lazily loads and caches the FAISS vectorstore. Previously this called
+    FAISS.load_local() (and build_embeddings()) fresh on every single
+    request, since rag_answer() calls this unconditionally at the start of
+    every question — meaning both the embedding model AND the FAISS index
+    were being reloaded from disk on every request. Cached here the same
+    way as the reranker and the embeddings model above.
+    """
+    global _vectorstore_cache
+    if _vectorstore_cache is not None:
+        return _vectorstore_cache
+
     if not index_path.exists():
         raise FileNotFoundError(
             f"FAISS index not found at {index_path}. Run ingest.py first."
         )
-    return FAISS.load_local(
+    logger.info("Loading FAISS vectorstore from %s (one-time load)...", index_path)
+    _vectorstore_cache = FAISS.load_local(
         str(index_path),
         build_embeddings(),
+        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
         allow_dangerous_deserialization=True,
     )
+    logger.info("FAISS vectorstore loaded and cached.")
+    return _vectorstore_cache
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +339,7 @@ def apply_threshold(
     results: list[tuple],
     threshold: float = SIMILARITY_THRESHOLD,
     higher_is_better: bool = True,
+    strict: bool = True,
 ) -> list[tuple]:
     """
     Filters results by similarity score threshold.
@@ -311,9 +349,18 @@ def apply_threshold(
         threshold:        minimum acceptable score
         higher_is_better: True for cosine/RRF (higher = better)
                           False for L2 distance (lower = better)
+        strict:           if True (default), returns an EMPTY list when
+                          nothing clears the threshold — this is what makes
+                          the threshold meaningful for hallucination
+                          prevention: low-confidence retrieval should lead
+                          to a refusal downstream, not silently degrade
+                          into serving unfiltered, unvetted results.
+                          Pass strict=False only if you deliberately want
+                          the old lenient fallback behavior for a specific
+                          non-safety-critical use case.
 
     Returns:
-        Filtered list. Falls back to all results if everything filtered out.
+        Filtered list. Empty if nothing qualifies and strict=True.
     """
     if higher_is_better:
         filtered = [(doc, score) for doc, score in results if score >= threshold]
@@ -321,8 +368,15 @@ def apply_threshold(
         filtered = [(doc, score) for doc, score in results if score <= threshold]
 
     if not filtered:
+        if strict:
+            logger.warning(
+                "Threshold %.2f filtered ALL results — returning EMPTY (strict mode). "
+                "This should lead to a refusal, not a fabricated answer.", threshold
+            )
+            return []
         logger.warning(
-            "Threshold %.2f filtered ALL results — returning unfiltered top results.", threshold
+            "Threshold %.2f filtered ALL results — returning unfiltered top results "
+            "(strict=False was explicitly requested).", threshold
         )
         return results
 
@@ -363,13 +417,26 @@ def rerank_results(
     Reranks retrieved chunks using a CrossEncoder model.
     CrossEncoder reads question + chunk together → more accurate relevance score.
 
+    NOTE ON SCORE SCALE: this returns the RAW CrossEncoder score, unmodified.
+    An earlier version of this function applied a sigmoid transform on the
+    assumption that raw scores were wide, unbounded logits — that assumption
+    was never verified against this specific model's actual output, and it
+    was wrong: BAAI/bge-reranker-large's raw scores for this dataset already
+    behave as a well-calibrated relevance signal (empirically, strong matches
+    land ~0.8-0.95 raw). Applying sigmoid on top of that compressed genuinely
+    good matches down to ~0.6-0.7, which is what caused a real regression.
+    Do not reintroduce a normalization step here without first empirically
+    checking the real score distribution this model produces on real data —
+    a threshold is only meaningful against a score whose actual behavior has
+    been observed, not assumed.
+
     Args:
         question: the user's question
         results:  list of (document, score) tuples from retrieval
         top_k:    number of results to return after reranking
 
     Returns:
-        Reranked list of (document, reranker_score) tuples, best-first.
+        Reranked list of (document, raw_crossencoder_score) tuples, best-first.
         Returns original results if sentence_transformers not installed.
     """
     if not results:
@@ -386,12 +453,12 @@ def rerank_results(
 
     try:
         pairs = [(question, doc.page_content) for doc, _ in results]
-        scores = reranker.predict(pairs)
+        raw_scores = reranker.predict(pairs)
 
         ranked = sorted(
-            zip(results, scores),
+            zip(results, raw_scores),
             key=lambda x: x[1],
-            reverse=True,  # higher CrossEncoder score = better
+            reverse=True,  # higher raw CrossEncoder score = better
         )
         # Return (document, crossencoder_score) — not original RRF score
         return [(item[0][0], float(item[1])) for item in ranked[:top_k]]
