@@ -96,10 +96,6 @@ class WorkflowsResponse(BaseModel):
     workflows: list[str]
 
 
-class HistoryResponse(BaseModel):
-    status: str
-
-
 class IndexStatusResponse(BaseModel):
     status: str
     index_exists: bool
@@ -198,29 +194,6 @@ def list_feedback(session_id: str | None = None, limit: int = 100) -> FeedbackLi
     rows = db.fetch_feedback(session_id=session_id, limit=limit)
     counts = db.feedback_counts()
     return FeedbackListResponse(feedback=rows, counts=counts)
-
-
-@app.delete("/api/history", response_model=HistoryResponse)
-def clear_history(session_id: str = "default") -> HistoryResponse:
-    """
-    Clears the server-side chat memory for one session only
-    (memory/rag_memory_<session_id>.json). Other users' / other
-    sessions' history is untouched.
-    Called when user clicks New Chat so the next conversation
-    starts with a completely clean context window.
-    """
-    path = memory_file_path(session_id)
-    try:
-        if path.exists():
-            path.write_text("[]", encoding="utf-8")
-            logger.info("Chat memory cleared for session_id=%s", session_id)
-        else:
-            logger.info("No chat memory found for session_id=%s — nothing to clear.", session_id)
-    except Exception:
-        logger.exception("Failed to clear chat memory for session_id=%s", session_id)
-        raise HTTPException(status_code=500, detail="Could not clear chat history.")
-
-    return HistoryResponse(status="cleared")
 
 
 @app.get("/api/index/status", response_model=IndexStatusResponse)
