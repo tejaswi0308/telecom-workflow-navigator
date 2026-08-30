@@ -126,7 +126,7 @@ def build_llm():
         )
 
     if provider == "groq":
-        model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+        model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         return ChatGroq(model=model_name, temperature=TEMPERATURE)
 
     raise ValueError(f"Unknown LLM_PROVIDER '{provider}'. Use 'azure' or 'groq'.")
@@ -137,7 +137,7 @@ def current_model_name() -> str:
     provider = os.getenv("LLM_PROVIDER", "azure").lower()
     if provider == "azure":
         return os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "azure-openai")
-    return os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    return os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
 # ---------------------------------------------------------------------------
