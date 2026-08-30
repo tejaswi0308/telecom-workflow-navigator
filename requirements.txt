@@ -1,0 +1,32 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+
+# LangChain provider/integration packages used by the code
+langchain-groq
+langchain-openai
+langchain-huggingface
+langchain-community
+
+# Optional tracing
+langfuse
+
+# Embeddings / reranker / sentence transformers
+sentence-transformers
+transformers
+huggingface-hub
+accelerate
+
+# BM25
+rank-bm25
+
+# FAISS (CPU build) — required for vectorstore
+faiss-cpu
+
+# Evaluation utilities
+ragas
+datasets
+
+# Numeric tooling
+numpy
